@@ -29,8 +29,9 @@ export async function uploadBuffer(
     ContentType: contentType,
   }));
 
-  if (config.storage.r2PublicUrl) {
-    return `${config.storage.r2PublicUrl}/${key}`;
+  const publicBase = config.storage.r2PublicUrl?.trim();
+  if (publicBase) {
+    return `${publicBase}/${key}`;
   }
   // Return signed URL (valid 7 days) if no public URL configured
   return getSignedUrl(client, new GetObjectCommand({

@@ -51,6 +51,7 @@ export async function triggerVideoRender(
         music_type: payload.music_type,
         webhook_url: payload.webhook_url,
         webhook_secret: payload.webhook_secret,
+        caption: job.caption || '',
       },
     }),
   });

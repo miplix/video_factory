@@ -42,74 +42,247 @@ on:
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
+      - name: Checkout repo (for fonts + helpers)
+        uses: actions/checkout@v4
+
       - name: Install dependencies
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-liberation fonts-dejavu fonts-noto-color-emoji
           ffmpeg -version | head -1
-          pip3 install boto3 edge-tts -q
+          pip3 install -q boto3 edge-tts requests faster-whisper
           echo "✅ Dependencies installed"
 
       - name: Create workspace
-        run: mkdir -p /tmp/render/slides
+        run: |
+          mkdir -p /tmp/render/slides /tmp/render/broll /tmp/render/fonts
+          # Copy Inter fonts from repo so ASS subtitles look consistent with slides
+          cp -f src/lib/fonts/Inter-Regular.ttf /tmp/render/fonts/ 2>/dev/null || true
+          cp -f src/lib/fonts/Inter-Bold.ttf    /tmp/render/fonts/ 2>/dev/null || true
+          ls -la /tmp/render/fonts
 
       - name: Download slides
         run: |
           python3 - <<'PYEOF'
           import json, os, urllib.request
-
           urls = json.loads(os.environ.get('SLIDE_URLS', '[]'))
           for i, url in enumerate(urls):
-              print(f"Downloading slide {i+1}/{len(urls)}: {url[:80]}...")
+              print(f"Downloading slide {i+1}/{len(urls)}...")
               urllib.request.urlretrieve(url, f"/tmp/render/slides/slide_{i:02d}.png")
-              print(f"  ✅ slide_{i:02d}.png")
           PYEOF
         env:
           SLIDE_URLS: ${{ inputs.slide_urls }}
 
-      - name: Generate voiceover with edge-tts (free Microsoft Neural TTS)
+      - name: Generate voiceover with edge-tts
         run: |
-          VOICE_TEXT="${{ inputs.voiceover_text }}"
-
-          if [ -z "$VOICE_TEXT" ]; then
-            echo "No voiceover text — skipping TTS"
-            exit 0
-          fi
-
-          echo "Generating Russian voiceover with edge-tts..."
           python3 - <<'PYEOF'
-          import os, asyncio
-          import edge_tts
-
-          text = os.environ.get('VOICE_TEXT', '')
-          if not text.strip():
-              print("Empty text — skipping")
-              exit(0)
-
-          async def generate():
-              # ru-RU-DmitryNeural — мужской голос
-              # ru-RU-SvetlanaNeural — женский голос
-              communicate = edge_tts.Communicate(text, voice="ru-RU-DmitryNeural", rate="+5%")
-              await communicate.save("/tmp/render/voiceover.mp3")
+          import os, asyncio, edge_tts
+          text = os.environ.get('VOICE_TEXT', '').strip()
+          if not text:
+              print("No voiceover text — skipping"); exit(0)
+          async def run():
+              c = edge_tts.Communicate(text, voice="ru-RU-DmitryNeural", rate="+5%")
+              await c.save("/tmp/render/voiceover.mp3")
               print("✅ Voiceover generated")
-
-          asyncio.run(generate())
+          asyncio.run(run())
           PYEOF
         env:
           VOICE_TEXT: ${{ inputs.voiceover_text }}
 
-      - name: Generate background music (cosmic ambient via ffmpeg)
+      - name: Generate karaoke subtitles (Whisper word-timestamps)
+        if: ${{ inputs.voiceover_text != '' }}
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          from faster_whisper import WhisperModel
+
+          audio = '/tmp/render/voiceover.mp3'
+          if not os.path.exists(audio):
+              print("No voiceover audio — skipping karaoke"); exit(0)
+
+          print("Loading Whisper small (int8)...")
+          model = WhisperModel('small', device='cpu', compute_type='int8')
+          segments, info = model.transcribe(
+              audio, language='ru', word_timestamps=True, beam_size=1,
+          )
+
+          words = []
+          for seg in segments:
+              if not seg.words:
+                  continue
+              for w in seg.words:
+                  txt = w.word.strip()
+                  if not txt:
+                      continue
+                  words.append({'word': txt, 'start': float(w.start), 'end': float(w.end)})
+
+          if not words:
+              print("Whisper returned no words — skipping karaoke"); exit(0)
+
+          def fmt(t):
+              h = int(t // 3600); m = int((t % 3600) // 60); s = t - h*3600 - m*60
+              return f"{h:01d}:{m:02d}:{s:05.2f}"
+
+          # Group words into 3-per-line karaoke windows with \kf (fill) highlight.
+          LINES = []
+          i = 0
+          while i < len(words):
+              group = words[i:i+3]
+              i += 3
+              start = group[0]['start']
+              end = group[-1]['end'] + 0.15
+              parts = []
+              for w in group:
+                  cs = max(1, int((w['end'] - w['start']) * 100))
+                  clean = w['word'].upper().replace('{', '').replace('}', '')
+                  parts.append(f"{{\\kf{cs}}}{clean}")
+              LINES.append((start, end, ' '.join(parts)))
+
+          out_lines = [
+              '[Script Info]',
+              'ScriptType: v4.00+',
+              'PlayResX: 1080',
+              'PlayResY: 1920',
+              'ScaledBorderAndShadow: yes',
+              '',
+              '[V4+ Styles]',
+              'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
+              'Style: Kar,Inter,82,&H0094B7F6,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5,2,2,80,80,300,1',
+              '',
+              '[Events]',
+              'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+          ]
+          for s, e, t in LINES:
+              out_lines.append(f"Dialogue: 0,{fmt(s)},{fmt(e)},Kar,,0,0,0,,{{\\fad(60,80)}}{t}")
+
+          with open('/tmp/render/karaoke.ass', 'w', encoding='utf-8') as f:
+              f.write('\n'.join(out_lines) + '\n')
+          print(f"✅ Karaoke subtitle written: {len(LINES)} lines, {len(words)} words")
+          PYEOF
+
+      - name: Fetch Pexels B-roll (optional)
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          MUSIC_TYPE: ${{ inputs.music_type }}
+        run: |
+          if [ -z "$PEXELS_API_KEY" ]; then
+            echo "PEXELS_API_KEY not set — skipping B-roll (slides-only render)"
+            exit 0
+          fi
+          python3 - <<'PYEOF'
+          import os, json, requests, random
+
+          key = os.environ['PEXELS_API_KEY']
+          music = os.environ.get('MUSIC_TYPE', 'cosmic_ambient')
+          QUERIES = {
+              'cosmic_ambient': ['nebula', 'galaxy stars', 'cosmic dust slow', 'aurora'],
+              'energetic':      ['neon lights city', 'fire slow motion', 'concert crowd', 'abstract pink'],
+              'mystical':       ['forest mist', 'candle flame close', 'crystal glow', 'moon night'],
+              'upbeat':         ['confetti falling', 'dance silhouette', 'neon abstract', 'balloons sky'],
+          }
+          queries = QUERIES.get(music, QUERIES['cosmic_ambient'])
+
+          os.makedirs('/tmp/render/broll', exist_ok=True)
+          headers = {'Authorization': key}
+          downloaded = []
+          for idx, q in enumerate(queries[:4]):
+              try:
+                  r = requests.get(
+                      'https://api.pexels.com/videos/search',
+                      headers=headers,
+                      params={'query': q, 'orientation': 'portrait', 'per_page': 5, 'size': 'medium'},
+                      timeout=15,
+                  )
+                  r.raise_for_status()
+                  vids = r.json().get('videos', [])
+                  if not vids: continue
+                  pick = random.choice(vids)
+                  files = [f for f in pick['video_files'] if f.get('width', 0) >= 720 and f.get('height', 0) >= 1080]
+                  if not files:
+                      files = pick['video_files']
+                  f = sorted(files, key=lambda x: -(x.get('width') or 0))[0]
+                  url = f['link']
+                  path = f'/tmp/render/broll/broll_{idx:02d}.mp4'
+                  print(f"  [{q}] → {url[:80]}...")
+                  with requests.get(url, stream=True, timeout=60) as resp:
+                      resp.raise_for_status()
+                      with open(path, 'wb') as out:
+                          for chunk in resp.iter_content(chunk_size=8192):
+                              out.write(chunk)
+                  downloaded.append(path)
+              except Exception as e:
+                  print(f"  ⚠ Pexels fetch failed for '{q}': {e}")
+          print(f"✅ Pexels clips: {len(downloaded)}")
+          PYEOF
+
+      - name: Try Luma AI video (optional, graceful fallback to B-roll/slide)
+        env:
+          LUMA_API_KEY: ${{ secrets.LUMA_API_KEY }}
+          CAPTION: ${{ inputs.caption }}
+          MUSIC_TYPE: ${{ inputs.music_type }}
+        run: |
+          if [ -z "$LUMA_API_KEY" ]; then
+            echo "LUMA_API_KEY not set — skipping Luma AI (free fallback: Pexels/slide Ken Burns)"
+            exit 0
+          fi
+          python3 - <<'PYEOF'
+          import os, time, requests
+          key = os.environ['LUMA_API_KEY']
+          music = os.environ.get('MUSIC_TYPE', 'cosmic_ambient')
+          prompt_map = {
+              'cosmic_ambient': 'ethereal cosmic nebula, purple and gold stardust floating in slow motion, cinematic, 9:16',
+              'energetic':      'neon light streaks, vibrant pink and blue, abstract motion, cinematic, 9:16',
+              'mystical':       'mystical forest with golden light rays, slow camera push, cinematic, 9:16',
+              'upbeat':         'colorful confetti falling slow motion against gradient sky, cinematic, 9:16',
+          }
+          prompt = prompt_map.get(music, prompt_map['cosmic_ambient'])
+          try:
+              r = requests.post(
+                  'https://api.lumalabs.ai/dream-machine/v1/generations',
+                  headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
+                  json={'prompt': prompt, 'aspect_ratio': '9:16', 'loop': False},
+                  timeout=30,
+              )
+              r.raise_for_status()
+              gen_id = r.json()['id']
+              print(f"Luma job: {gen_id}")
+              # Poll up to 3 min
+              for _ in range(36):
+                  time.sleep(5)
+                  s = requests.get(
+                      f'https://api.lumalabs.ai/dream-machine/v1/generations/{gen_id}',
+                      headers={'Authorization': f'Bearer {key}'}, timeout=15,
+                  )
+                  s.raise_for_status()
+                  d = s.json()
+                  state = d.get('state', 'unknown')
+                  print(f"  state={state}")
+                  if state == 'completed':
+                      url = d['assets']['video']
+                      with requests.get(url, stream=True, timeout=60) as resp:
+                          resp.raise_for_status()
+                          with open('/tmp/render/luma.mp4', 'wb') as out:
+                              for chunk in resp.iter_content(8192):
+                                  out.write(chunk)
+                      print("✅ Luma clip saved"); break
+                  if state == 'failed':
+                      print(f"Luma failed: {d.get('failure_reason', '?')}"); break
+              else:
+                  print("Luma timed out — falling back")
+          except Exception as e:
+              print(f"⚠ Luma skipped: {e}")
+          PYEOF
+
+      - name: Generate background music
         run: |
           DURATION=$(python3 -c "
           import json, os
           d = json.loads(os.environ.get('DURATIONS','[4,4,4,4,4,4]'))
-          print(sum(d) + 5)
+          print(sum(d) + 8)
           ")
-          echo "Total duration: ${DURATION}s — generating ambient music"
-
-          # 528 Hz solfeggio + harmonics → cosmic ambient feel
           ffmpeg -y \
             -f lavfi -i "aevalsrc=0.10*sin(528*2*PI*t)+0.06*sin(1056*2*PI*t)+0.04*sin(396*2*PI*t):s=44100" \
             -f lavfi -i "aevalsrc=0.06*sin(174*2*PI*t)+0.04*sin(285*2*PI*t):s=44100" \
@@ -121,28 +294,26 @@ jobs:
               afade=t=in:st=0:d=2,\
               afade=t=out:st=${DURATION}:d=4[music]" \
             -map "[music]" -t "$DURATION" \
-            /tmp/render/music.mp3 2>/dev/null && echo "✅ Music generated" || echo "⚠️ Music generation failed (non-fatal)"
+            /tmp/render/music.mp3 2>/dev/null && echo "✅ Music generated" || echo "⚠ Music generation failed"
         env:
           DURATIONS: ${{ inputs.scene_durations }}
 
-      - name: Build video from slides (Ken Burns effect)
+      - name: Build video (Ken Burns + B-roll/Luma + xfade transitions)
         run: |
           python3 - <<'PYEOF'
-          import json, os, subprocess, glob
+          import json, os, subprocess, glob, random
 
           durations = json.loads(os.environ.get('DURATIONS', '[4,4,4,4,4,4]'))
           slides = sorted(glob.glob('/tmp/render/slides/slide_*.png'))
-
           if not slides:
-              print("ERROR: No slides found!")
-              exit(1)
+              print("ERROR: No slides found"); exit(1)
 
-          print(f"Found {len(slides)} slides")
           while len(durations) < len(slides):
               durations.append(4)
 
-          # --- Safety net: measure actual voiceover duration.
-          # If total video < voice + 1.5s tail, extend the last scene so speech never cuts off.
+          # --- Voice-length safety (must run before xfade shrinkage calc).
+          XFADE = 0.5
+          shrink = (len(slides) - 1) * XFADE
           voice_path = '/tmp/render/voiceover.mp3'
           if os.path.exists(voice_path):
               try:
@@ -150,100 +321,201 @@ jobs:
                       'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
                       '-of', 'default=noprint_wrappers=1:nokey=1', voice_path,
                   ], text=True).strip()
-                  voice_dur = float(out)
-                  video_dur = sum(durations)
-                  target = voice_dur + 1.5
-                  if video_dur < target:
-                      extra = target - video_dur
-                      durations[-1] = durations[-1] + extra
-                      print(f"⚙ Extended last scene by {extra:.2f}s (voice={voice_dur:.2f}s, video was {video_dur:.2f}s)")
-                  else:
-                      print(f"✓ Video {video_dur:.2f}s fits voice {voice_dur:.2f}s")
+                  vdur = float(out)
+                  raw_total = sum(durations)
+                  effective = raw_total - shrink
+                  target = vdur + 1.5
+                  if effective < target:
+                      extra = target - effective
+                      durations[-1] += extra
+                      print(f"⚙ Extended last scene by {extra:.2f}s (voice={vdur:.2f}s, effective was {effective:.2f}s)")
               except Exception as e:
-                  print(f"⚠ Voice-duration probe failed: {e}")
+                  print(f"⚠ ffprobe failed: {e}")
 
-          # Ken Burns zoom variants per slide
+          # --- Per-scene source: Luma (hook) / B-roll (available) / Ken Burns slide.
+          luma_path = '/tmp/render/luma.mp4' if os.path.exists('/tmp/render/luma.mp4') else None
+          broll = sorted(glob.glob('/tmp/render/broll/broll_*.mp4'))
+          print(f"Sources: {len(slides)} slides, {len(broll)} B-roll, luma={'yes' if luma_path else 'no'}")
+
           zoom_configs = [
-              "z='min(zoom+0.0003,1.05)'",  # slow zoom in
-              "z='if(lte(zoom,1.0),1.05,max(1.0,zoom-0.0003))'",  # zoom out
-              "z='min(zoom+0.0002,1.04)'",  # very slow zoom in
-              "z='1.03'",  # slight zoom, stable
-              "z='min(zoom+0.0004,1.06)'",  # faster zoom
-              "z='if(lte(zoom,1.0),1.04,max(1.0,zoom-0.0002))'",  # gentle zoom out
+              "z='min(zoom+0.0003,1.05)'",
+              "z='if(lte(zoom,1.0),1.05,max(1.0,zoom-0.0003))'",
+              "z='min(zoom+0.0002,1.04)'",
+              "z='1.03'",
+              "z='min(zoom+0.0004,1.06)'",
+              "z='if(lte(zoom,1.0),1.04,max(1.0,zoom-0.0002))'",
           ]
+
+          # Assign B-roll to middle scenes (avoid hook/CTA which should show full brand)
+          n = len(slides)
+          broll_slots = {}  # scene_index -> broll_path
+          if broll and n > 2:
+              middle = list(range(1, n - 1))  # exclude first and last
+              random.shuffle(middle)
+              for i, idx in enumerate(middle[:min(2, len(broll))]):
+                  broll_slots[idx] = broll[i % len(broll)]
+          print(f"B-roll assigned to scenes: {sorted(broll_slots.keys())}")
 
           segments = []
           for i, (slide, dur) in enumerate(zip(slides, durations)):
               out = f'/tmp/render/seg_{i:02d}.mp4'
               frames = int(dur * 30)
-              z_expr = zoom_configs[i % len(zoom_configs)]
-              vf = (
-                  f'scale=1080:1920:force_original_aspect_ratio=increase,'
-                  f'crop=1080:1920,'
-                  f"zoompan={z_expr}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30"
-              )
-              cmd = [
-                  'ffmpeg', '-y', '-loop', '1', '-i', slide,
-                  '-vf', vf, '-t', str(dur),
-                  '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
-                  '-pix_fmt', 'yuv420p', '-an', out
-              ]
-              print(f"  Rendering segment {i+1}/{len(slides)}: {dur}s")
-              result = subprocess.run(cmd, capture_output=True, text=True)
-              if result.returncode != 0:
-                  print(f"  ⚠️ Ken Burns failed, using static: {result.stderr[-200:]}")
-                  cmd_simple = [
+
+              # Luma on hook scene (0) if available
+              if i == 0 and luma_path:
+                  cmd = [
+                      'ffmpeg', '-y', '-stream_loop', '-1', '-i', luma_path,
+                      '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30',
+                      '-t', str(dur), '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+                      '-pix_fmt', 'yuv420p', '-an', out,
+                  ]
+              # B-roll on assigned middle scenes
+              elif i in broll_slots:
+                  clip = broll_slots[i]
+                  cmd = [
+                      'ffmpeg', '-y', '-stream_loop', '-1', '-i', clip, '-i', slide,
+                      '-filter_complex',
+                      '[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,eq=brightness=-0.10[bg];'
+                      '[bg][1:v]overlay=0:0:format=auto,format=yuv420p[v]',
+                      '-map', '[v]', '-t', str(dur),
+                      '-c:v', 'libx264', '-preset', 'fast', '-crf', '22', '-an', out,
+                  ]
+              # Default: Ken Burns on slide
+              else:
+                  z = zoom_configs[i % len(zoom_configs)]
+                  vf = (
+                      f'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,'
+                      f"zoompan={z}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30"
+                  )
+                  cmd = [
+                      'ffmpeg', '-y', '-loop', '1', '-i', slide,
+                      '-vf', vf, '-t', str(dur),
+                      '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+                      '-pix_fmt', 'yuv420p', '-an', out,
+                  ]
+
+              print(f"  Segment {i+1}/{n}: {dur:.2f}s [{'luma' if i==0 and luma_path else 'broll' if i in broll_slots else 'slide'}]")
+              r = subprocess.run(cmd, capture_output=True, text=True)
+              if r.returncode != 0:
+                  print(f"  ⚠ failed, fallback static slide: {r.stderr[-200:]}")
+                  subprocess.run([
                       'ffmpeg', '-y', '-loop', '1', '-i', slide,
                       '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
                       '-t', str(dur), '-c:v', 'libx264', '-preset', 'fast',
-                      '-crf', '22', '-pix_fmt', 'yuv420p', '-an', out
-                  ]
-                  subprocess.run(cmd_simple, check=True)
+                      '-crf', '22', '-pix_fmt', 'yuv420p', '-an', out,
+                  ], check=True)
               segments.append(out)
-              print(f"  ✅ seg_{i:02d}.mp4")
 
-          with open('/tmp/render/concat.txt', 'w') as f:
-              for seg in segments:
-                  f.write(f"file '{seg}'\n")
+          # --- Stitch with xfade crossfade (varied transitions).
+          if len(segments) == 1:
+              subprocess.run(['cp', segments[0], '/tmp/render/video_stitched.mp4'], check=True)
+          else:
+              transitions = ['fade', 'smoothleft', 'circleopen', 'slideleft', 'fade', 'smoothright']
+              inputs_flat = []
+              for s in segments:
+                  inputs_flat += ['-i', s]
 
-          subprocess.run([
-              'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
-              '-i', '/tmp/render/concat.txt', '-c', 'copy',
-              '/tmp/render/video_raw.mp4'
-          ], check=True)
-          print("✅ Segments concatenated")
+              filters = []
+              prev = '[0:v]'
+              cum = durations[0]
+              for idx in range(1, len(segments)):
+                  t = transitions[(idx - 1) % len(transitions)]
+                  offset = cum - XFADE
+                  out_lbl = f'[v{idx}]'
+                  filters.append(
+                      f'{prev}[{idx}:v]xfade=transition={t}:duration={XFADE}:offset={offset:.3f}{out_lbl}'
+                  )
+                  prev = out_lbl
+                  cum += durations[idx] - XFADE
+              filter_complex = ';'.join(filters)
+
+              cmd = [
+                  'ffmpeg', '-y', *inputs_flat,
+                  '-filter_complex', filter_complex,
+                  '-map', prev,
+                  '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+                  '-pix_fmt', 'yuv420p',
+                  '/tmp/render/video_stitched.mp4',
+              ]
+              print(f"Stitching with xfade ({len(segments)} segments)...")
+              r = subprocess.run(cmd, capture_output=True, text=True)
+              if r.returncode != 0:
+                  print(f"⚠ xfade failed, falling back to concat: {r.stderr[-300:]}")
+                  with open('/tmp/render/concat.txt', 'w') as f:
+                      for s in segments:
+                          f.write(f"file '{s}'\n")
+                  subprocess.run([
+                      'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+                      '-i', '/tmp/render/concat.txt', '-c', 'copy',
+                      '/tmp/render/video_stitched.mp4',
+                  ], check=True)
+              else:
+                  print("✅ xfade stitched")
           PYEOF
         env:
           DURATIONS: ${{ inputs.scene_durations }}
 
+      - name: Overlay karaoke subtitles + voice waveform
+        run: |
+          HAVE_SUBS=$([ -f /tmp/render/karaoke.ass ] && echo yes || echo no)
+          HAVE_VOICE=$([ -f /tmp/render/voiceover.mp3 ] && echo yes || echo no)
+          echo "Subs: $HAVE_SUBS | Voice: $HAVE_VOICE"
+
+          IN=/tmp/render/video_stitched.mp4
+          OUT=/tmp/render/video_final.mp4
+
+          if [ "$HAVE_SUBS" = "yes" ] && [ "$HAVE_VOICE" = "yes" ]; then
+            # Burn subtitles + overlay showwaves waveform above karaoke
+            ffmpeg -y -i "$IN" -i /tmp/render/voiceover.mp3 \
+              -filter_complex "\
+                [0:v]subtitles=/tmp/render/karaoke.ass:fontsdir=/tmp/render/fonts[vs];\
+                [1:a]showwaves=s=1080x80:mode=cline:colors=0xB794F6|0xD4A574:rate=30,format=rgba,colorkey=black:0.01:0[wave];\
+                [vs][wave]overlay=0:H-460:format=auto[vout]" \
+              -map "[vout]" -c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p -an \
+              "$OUT" && echo "✅ Karaoke + waveform burned in"
+          elif [ "$HAVE_SUBS" = "yes" ]; then
+            ffmpeg -y -i "$IN" \
+              -vf "subtitles=/tmp/render/karaoke.ass:fontsdir=/tmp/render/fonts" \
+              -c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p -an \
+              "$OUT" && echo "✅ Karaoke burned in"
+          elif [ "$HAVE_VOICE" = "yes" ]; then
+            ffmpeg -y -i "$IN" -i /tmp/render/voiceover.mp3 \
+              -filter_complex "\
+                [1:a]showwaves=s=1080x80:mode=cline:colors=0xB794F6|0xD4A574:rate=30,format=rgba,colorkey=black:0.01:0[wave];\
+                [0:v][wave]overlay=0:H-380:format=auto[vout]" \
+              -map "[vout]" -c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p -an \
+              "$OUT" && echo "✅ Waveform overlaid"
+          else
+            cp "$IN" "$OUT"
+            echo "No subs/voice overlays — video passed through"
+          fi
+          ls -lh "$OUT"
+
       - name: Mix audio (voiceover + background music)
         run: |
-          HAVE_VOICE=$([ -f /tmp/render/voiceover.mp3 ] && echo "yes" || echo "no")
-          HAVE_MUSIC=$([ -f /tmp/render/music.mp3 ] && echo "yes" || echo "no")
-          echo "Voiceover: $HAVE_VOICE | Music: $HAVE_MUSIC"
+          HAVE_VOICE=$([ -f /tmp/render/voiceover.mp3 ] && echo yes || echo no)
+          HAVE_MUSIC=$([ -f /tmp/render/music.mp3 ] && echo yes || echo no)
+          echo "Voice: $HAVE_VOICE | Music: $HAVE_MUSIC"
 
           if [ "$HAVE_VOICE" = "yes" ] && [ "$HAVE_MUSIC" = "yes" ]; then
-            ffmpeg -y \
-              -i /tmp/render/video_raw.mp4 \
-              -i /tmp/render/voiceover.mp3 \
-              -i /tmp/render/music.mp3 \
+            ffmpeg -y -i /tmp/render/video_final.mp4 \
+              -i /tmp/render/voiceover.mp3 -i /tmp/render/music.mp3 \
               -filter_complex "[1:a]volume=1.0[v];[2:a]volume=0.18[m];[v][m]amix=inputs=2:duration=first:dropout_transition=2[a]" \
               -map "0:v" -map "[a]" -c:v copy -c:a aac -b:a 192k -shortest \
-              /tmp/render/output.mp4 && echo "✅ Mixed: voice + music"
+              /tmp/render/output.mp4 && echo "✅ Mixed voice + music"
           elif [ "$HAVE_VOICE" = "yes" ]; then
-            ffmpeg -y -i /tmp/render/video_raw.mp4 -i /tmp/render/voiceover.mp3 \
-              -c:v copy -c:a aac -b:a 192k -shortest \
-              /tmp/render/output.mp4 && echo "✅ Mixed: voice only"
+            ffmpeg -y -i /tmp/render/video_final.mp4 -i /tmp/render/voiceover.mp3 \
+              -c:v copy -c:a aac -b:a 192k -shortest /tmp/render/output.mp4 \
+              && echo "✅ Mixed voice only"
           elif [ "$HAVE_MUSIC" = "yes" ]; then
-            ffmpeg -y -i /tmp/render/video_raw.mp4 -i /tmp/render/music.mp3 \
+            ffmpeg -y -i /tmp/render/video_final.mp4 -i /tmp/render/music.mp3 \
               -filter_complex "[1:a]volume=0.4[a]" -map "0:v" -map "[a]" \
-              -c:v copy -c:a aac -b:a 192k -shortest \
-              /tmp/render/output.mp4 && echo "✅ Mixed: music only"
+              -c:v copy -c:a aac -b:a 192k -shortest /tmp/render/output.mp4 \
+              && echo "✅ Mixed music only"
           else
-            cp /tmp/render/video_raw.mp4 /tmp/render/output.mp4
-            echo "⚠️ No audio — video only"
+            cp /tmp/render/video_final.mp4 /tmp/render/output.mp4
+            echo "⚠ No audio"
           fi
-
           ls -lh /tmp/render/output.mp4
 
       - name: Upload to Cloudflare R2
@@ -260,7 +532,7 @@ jobs:
           public_url_base = os.environ.get('R2_PUBLIC_URL', '').strip()
 
           if not all([account_id, access_key, secret_key]):
-              print("⚠️ R2 credentials not set — storing locally")
+              print("⚠ R2 creds not set — storing locally")
               with open('/tmp/render/video_url.txt', 'w') as f:
                   f.write(f"local://output_{job_id}.mp4")
               sys.exit(0)
@@ -271,23 +543,19 @@ jobs:
               aws_access_key_id=access_key,
               aws_secret_access_key=secret_key,
               config=Config(signature_version='s3v4'),
-              region_name='auto'
+              region_name='auto',
           )
-
           key = f'videos/{job_id}/output.mp4'
           print(f"Uploading {key} to R2...")
           with open('/tmp/render/output.mp4', 'rb') as f:
               s3.upload_fileobj(f, bucket, key, ExtraArgs={'ContentType': 'video/mp4'})
 
-          if public_url_base:
-              url = f"{public_url_base}/{key}"
-          else:
-              url = s3.generate_presigned_url(
-                  'get_object',
-                  Params={'Bucket': bucket, 'Key': key},
-                  ExpiresIn=604800
-              )
-
+          url = (f"{public_url_base}/{key}" if public_url_base else
+                 s3.generate_presigned_url(
+                     'get_object',
+                     Params={'Bucket': bucket, 'Key': key},
+                     ExpiresIn=604800,
+                 ))
           print(f"✅ Uploaded: {url[:100]}...")
           with open('/tmp/render/video_url.txt', 'w') as f:
               f.write(url)
@@ -305,41 +573,29 @@ jobs:
         run: |
           BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}"
           CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}"
-
           if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
-            echo "Telegram not configured"
-            exit 0
+            echo "Telegram not configured"; exit 0
           fi
-
           if [ ! -f /tmp/render/output.mp4 ] || [ ! -s /tmp/render/output.mp4 ]; then
             curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
               -H "Content-Type: application/json" \
               -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":\"❌ Ошибка рендеринга (job: ${{ inputs.job_id }})\"}"
             exit 0
           fi
+          CAPTION="${{ inputs.caption }}"
+          [ -z "$CAPTION" ] && CAPTION="🎬 Новое видео готово! #юпсол #астрология #yupsoul"
 
-          CUSTOM_CAPTION="${{ inputs.caption }}"
-          if [ -n "$CUSTOM_CAPTION" ]; then
-            CAPTION="$CUSTOM_CAPTION"
-          else
-            CAPTION="🎬 Новое видео готово! #юпсол #астрология #yupsoul"
-          fi
-
-          echo "Sending video to Telegram (chat: ${CHAT_ID})..."
           RESULT=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendVideo" \
             -F "chat_id=${CHAT_ID}" \
             -F "video=@/tmp/render/output.mp4" \
             -F "caption=${CAPTION}" \
-            -F "supports_streaming=true" \
-            -F "width=1080" \
-            -F "height=1920")
+            -F "supports_streaming=true" -F "width=1080" -F "height=1920")
 
-          TG_OK=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('ok'))" 2>/dev/null)
-          if [ "$TG_OK" = "True" ]; then
+          OK=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))" 2>/dev/null)
+          if [ "$OK" = "True" ]; then
             echo "✅ Video sent to Telegram"
           else
-            echo "⚠️ Telegram send failed: $RESULT"
-            # Fallback: send as document
+            echo "⚠ Telegram send failed: $RESULT"
             curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
               -F "chat_id=${CHAT_ID}" \
               -F "document=@/tmp/render/output.mp4" \
@@ -350,8 +606,7 @@ jobs:
         if: always()
         run: |
           VIDEO_URL=$(cat /tmp/render/video_url.txt 2>/dev/null || echo "")
-          STATUS=$([ -f /tmp/render/output.mp4 ] && [ -s /tmp/render/output.mp4 ] && echo "done" || echo "failed")
-
+          STATUS=$([ -f /tmp/render/output.mp4 ] && [ -s /tmp/render/output.mp4 ] && echo done || echo failed)
           curl -s -X POST "${{ inputs.webhook_url }}" \
             -H "Content-Type: application/json" \
             -H "X-Render-Secret: ${{ inputs.webhook_secret }}" \

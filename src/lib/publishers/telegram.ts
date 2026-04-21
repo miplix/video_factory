@@ -8,22 +8,14 @@ import type { AppConfig, VideoJob } from '../types';
 const TG_API = 'https://api.telegram.org/bot';
 
 export async function notifyVideoReady(job: VideoJob, config: AppConfig): Promise<void> {
+  // GitHub Actions workflow already sends the actual video file to Telegram
+  // with the full caption + hashtags during the "Send video to Telegram" step.
+  // We only mirror a link here for record — NO duplicate video upload.
   if (!config.telegram.botToken || !config.telegram.chatId) return;
-
-  const caption = buildCaption(job);
-  const videoUrl = job.videoPublicUrl || job.videoUrl;
-
-  if (!videoUrl) {
-    await sendMessage(config, `⚠️ Видео ${job.id} готово, но URL не получен.`);
-    return;
-  }
-
-  // Try to send as video first, fall back to link
-  try {
-    await sendVideo(config, videoUrl, caption);
-  } catch {
-    await sendMessage(config, `🎬 *Видео готово!*\n\n${caption}\n\n[Скачать видео](${videoUrl})`);
-  }
+  const url = job.videoPublicUrl || job.videoUrl;
+  if (!url) return; // keep quiet on success path
+  // No-op on done: TG already received the video from GH Actions.
+  // Left as a placeholder if you later want a short text ACK.
 }
 
 export async function sendRenderStarted(job: VideoJob, config: AppConfig): Promise<void> {

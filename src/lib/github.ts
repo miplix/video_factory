@@ -26,6 +26,14 @@ export async function triggerVideoRender(
     .join(' ... ') || '';
   const voiceoverText = normalizeForTTS(rawVoiceover);
 
+  // Single Telegram caption: intro + blank line + hashtags.
+  // This is what GH Actions uses in sendVideo — Vercel no longer double-sends.
+  const hashtagLine = (job.hashtags || []).join(' ').trim();
+  const tgCaption = [
+    (job.caption || '').trim(),
+    hashtagLine,
+  ].filter(Boolean).join('\n\n').slice(0, 900);
+
   const url = `https://api.github.com/repos/${config.github.owner}/${config.github.repo}/actions/workflows/${config.github.workflow}/dispatches`;
 
   const res = await fetch(url, {
@@ -46,7 +54,7 @@ export async function triggerVideoRender(
         music_type: job.script?.music || 'cosmic_ambient',
         webhook_url: `${webhookBaseUrl}/api/render/complete`,
         webhook_secret: config.renderWebhookSecret,
-        caption: (job.caption || '').slice(0, 500),
+        caption: tgCaption,
       },
     }),
   });

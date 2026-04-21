@@ -1,0 +1,305 @@
+name: Render Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Video job ID'
+        required: true
+        type: string
+      slide_urls:
+        description: 'JSON array of slide PNG URLs'
+        required: true
+        type: string
+      audio_url:
+        description: 'Voiceover MP3 URL'
+        required: true
+        type: string
+      scene_durations:
+        description: 'JSON array of scene durations in seconds'
+        required: true
+        type: string
+      music_type:
+        description: 'Background music type'
+        required: false
+        default: 'cosmic_ambient'
+        type: string
+      webhook_url:
+        description: 'Callback URL when render is complete'
+        required: true
+        type: string
+      webhook_secret:
+        description: 'Webhook auth secret'
+        required: true
+        type: string
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version | head -1
+          pip3 install boto3 -q
+
+      - name: Create workspace
+        run: mkdir -p /tmp/render/slides
+
+      - name: Download slides
+        run: |
+          URLS='${{ inputs.slide_urls }}'
+          DURATIONS='${{ inputs.scene_durations }}'
+
+          # Parse JSON arrays using python (pre-installed)
+          python3 - <<'PYEOF'
+          import json, os, urllib.request, sys
+
+          urls = json.loads(os.environ.get('SLIDE_URLS', '[]'))
+          for i, url in enumerate(urls):
+              print(f"Downloading slide {i+1}/{len(urls)}: {url[:80]}...")
+              urllib.request.urlretrieve(url, f"/tmp/render/slides/slide_{i:02d}.png")
+              print(f"  OK: slide_{i:02d}.png")
+          PYEOF
+        env:
+          SLIDE_URLS: ${{ inputs.slide_urls }}
+
+      - name: Download voiceover
+        run: |
+          python3 - <<'PYEOF'
+          import os, urllib.request
+          url = os.environ.get('AUDIO_URL', '')
+          if url:
+              print(f"Downloading audio: {url[:80]}...")
+              urllib.request.urlretrieve(url, "/tmp/render/voiceover.mp3")
+              print("  OK: voiceover.mp3")
+          PYEOF
+        env:
+          AUDIO_URL: ${{ inputs.audio_url }}
+
+      - name: Generate background music (cosmic ambient)
+        run: |
+          DURATION=$(python3 -c "
+          import json, os
+          d = json.loads(os.environ.get('DURATIONS','[4,4,4,4,4,4]'))
+          print(sum(d) + 5)
+          ")
+          echo "Total duration: ${DURATION}s"
+
+          # Generate ambient music using ffmpeg's built-in sine waves + reverb effect
+          # This creates a free royalty-free cosmic ambient track
+          ffmpeg -y \
+            -f lavfi -i "aevalsrc=0.12*sin(220*2*PI*t)+0.08*sin(440*2*PI*t)+0.05*sin(330*2*PI*t)+0.04*sin(880*2*PI*t):s=44100" \
+            -f lavfi -i "aevalsrc=0.07*sin(174.6*2*PI*t)+0.05*sin(196*2*PI*t):s=44100" \
+            -filter_complex "[0:a][1:a]amix=inputs=2:duration=first,\
+              aecho=0.8:0.88:60:0.4,\
+              aecho=0.8:0.88:100:0.3,\
+              lowpass=f=800,\
+              volume=0.3,\
+              afade=t=in:st=0:d=2,\
+              afade=t=out:st=${DURATION}:d=3[music]" \
+            -map "[music]" \
+            -t $DURATION \
+            /tmp/render/music.mp3
+          echo "Music generated"
+        env:
+          DURATIONS: ${{ inputs.scene_durations }}
+
+      - name: Build video from slides
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, subprocess, glob
+
+          durations = json.loads(os.environ.get('DURATIONS', '[4,4,4,4,4,4]'))
+          slides = sorted(glob.glob('/tmp/render/slides/slide_*.png'))
+
+          if len(slides) == 0:
+              print("ERROR: No slides found!")
+              exit(1)
+
+          print(f"Found {len(slides)} slides, {len(durations)} durations")
+
+          # Pad durations if needed
+          while len(durations) < len(slides):
+              durations.append(4)
+
+          segments = []
+          for i, (slide, dur) in enumerate(zip(slides, durations)):
+              out = f'/tmp/render/seg_{i:02d}.mp4'
+              # Ken Burns: slow zoom in for dynamic feel
+              zoom_end = 1.04 + (i % 3) * 0.01
+              frames = int(dur * 30)
+              cmd = [
+                  'ffmpeg', '-y',
+                  '-loop', '1', '-i', slide,
+                  '-vf', (
+                      f'scale=1080:1920:force_original_aspect_ratio=increase,'
+                      f'crop=1080:1920,'
+                      f"zoompan=z='min(zoom+{0.0002:.4f},1.04)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30"
+                  ),
+                  '-t', str(dur),
+                  '-c:v', 'libx264',
+                  '-preset', 'fast',
+                  '-crf', '22',
+                  '-pix_fmt', 'yuv420p',
+                  '-an',
+                  out
+              ]
+              print(f"  Rendering segment {i+1}: {dur}s → {out}")
+              result = subprocess.run(cmd, capture_output=True, text=True)
+              if result.returncode != 0:
+                  print("STDERR:", result.stderr[-500:])
+                  # Fallback: simple static segment
+                  cmd_simple = [
+                      'ffmpeg', '-y',
+                      '-loop', '1', '-i', slide,
+                      '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
+                      '-t', str(dur),
+                      '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+                      '-pix_fmt', 'yuv420p', '-an', out
+                  ]
+                  subprocess.run(cmd_simple, check=True)
+              segments.append(out)
+
+          # Write concat file
+          with open('/tmp/render/concat.txt', 'w') as f:
+              for seg in segments:
+                  f.write(f"file '{seg}'\n")
+
+          # Concatenate segments
+          subprocess.run([
+              'ffmpeg', '-y',
+              '-f', 'concat', '-safe', '0',
+              '-i', '/tmp/render/concat.txt',
+              '-c', 'copy',
+              '/tmp/render/video_raw.mp4'
+          ], check=True)
+          print("Video segments concatenated")
+          PYEOF
+        env:
+          DURATIONS: ${{ inputs.scene_durations }}
+
+      - name: Mix audio (voiceover + background music)
+        run: |
+          HAVE_VOICE=$(test -f /tmp/render/voiceover.mp3 && echo "yes" || echo "no")
+          HAVE_MUSIC=$(test -f /tmp/render/music.mp3 && echo "yes" || echo "no")
+          echo "Have voiceover: $HAVE_VOICE, Have music: $HAVE_MUSIC"
+
+          if [ "$HAVE_VOICE" = "yes" ] && [ "$HAVE_MUSIC" = "yes" ]; then
+            ffmpeg -y \
+              -i /tmp/render/video_raw.mp4 \
+              -i /tmp/render/voiceover.mp3 \
+              -i /tmp/render/music.mp3 \
+              -filter_complex "\
+                [1:a]volume=1.0[voice];\
+                [2:a]volume=0.18[music];\
+                [voice][music]amix=inputs=2:duration=first:dropout_transition=2[audio]" \
+              -map "0:v" -map "[audio]" \
+              -c:v copy -c:a aac -b:a 192k \
+              -shortest \
+              /tmp/render/output.mp4
+          elif [ "$HAVE_VOICE" = "yes" ]; then
+            ffmpeg -y \
+              -i /tmp/render/video_raw.mp4 \
+              -i /tmp/render/voiceover.mp3 \
+              -c:v copy -c:a aac -b:a 192k \
+              -shortest \
+              /tmp/render/output.mp4
+          elif [ "$HAVE_MUSIC" = "yes" ]; then
+            ffmpeg -y \
+              -i /tmp/render/video_raw.mp4 \
+              -i /tmp/render/music.mp3 \
+              -filter_complex "[1:a]volume=0.4[music]" \
+              -map "0:v" -map "[music]" \
+              -c:v copy -c:a aac -b:a 192k \
+              -shortest \
+              /tmp/render/output.mp4
+          else
+            # No audio — just copy video
+            cp /tmp/render/video_raw.mp4 /tmp/render/output.mp4
+          fi
+
+          ls -lh /tmp/render/output.mp4
+
+      - name: Upload to Cloudflare R2
+        run: |
+          JOB_ID="${{ inputs.job_id }}"
+          R2_KEY="videos/${JOB_ID}/output.mp4"
+
+          python3 - <<'PYEOF'
+          import os, sys, boto3, json
+          from botocore.config import Config
+
+          account_id = os.environ.get('R2_ACCOUNT_ID', '')
+          access_key = os.environ.get('R2_ACCESS_KEY_ID', '')
+          secret_key = os.environ.get('R2_SECRET_ACCESS_KEY', '')
+          bucket = os.environ.get('R2_BUCKET_NAME', 'yupsoul-videos')
+          job_id = os.environ.get('JOB_ID', '')
+          public_url_base = os.environ.get('R2_PUBLIC_URL', '')
+
+          if not all([account_id, access_key, secret_key]):
+              print("WARNING: R2 credentials not set — skipping upload")
+              # Write a placeholder URL for webhook
+              with open('/tmp/render/video_url.txt', 'w') as f:
+                  f.write(f"file://output_{job_id}.mp4")
+              sys.exit(0)
+
+          s3 = boto3.client(
+              's3',
+              endpoint_url=f'https://{account_id}.r2.cloudflarestorage.com',
+              aws_access_key_id=access_key,
+              aws_secret_access_key=secret_key,
+              config=Config(signature_version='s3v4'),
+              region_name='auto'
+          )
+
+          key = f'videos/{job_id}/output.mp4'
+          print(f"Uploading to R2: {key}")
+          with open('/tmp/render/output.mp4', 'rb') as f:
+              s3.upload_fileobj(f, bucket, key, ExtraArgs={'ContentType': 'video/mp4'})
+
+          if public_url_base:
+              url = f"{public_url_base}/{key}"
+          else:
+              # Generate presigned URL (7 days)
+              url = s3.generate_presigned_url(
+                  'get_object',
+                  Params={'Bucket': bucket, 'Key': key},
+                  ExpiresIn=604800
+              )
+
+          print(f"Video URL: {url[:100]}...")
+          with open('/tmp/render/video_url.txt', 'w') as f:
+              f.write(url)
+          PYEOF
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+          JOB_ID: ${{ inputs.job_id }}
+
+      - name: Notify webhook
+        if: always()
+        run: |
+          VIDEO_URL=$(cat /tmp/render/video_url.txt 2>/dev/null || echo "")
+          JOB_ID="${{ inputs.job_id }}"
+          WEBHOOK_URL="${{ inputs.webhook_url }}"
+          SECRET="${{ inputs.webhook_secret }}"
+
+          if [ -f /tmp/render/output.mp4 ] && [ -s /tmp/render/output.mp4 ]; then
+            STATUS="done"
+          else
+            STATUS="failed"
+          fi
+
+          echo "Notifying webhook: ${WEBHOOK_URL} status=${STATUS}"
+
+          curl -s -X POST "${WEBHOOK_URL}" \
+            -H "Content-Type: application/json" \
+            -H "X-Render-Secret: ${SECRET}" \
+            -d "{\"job_id\":\"${JOB_ID}\",\"status\":\"${STATUS}\",\"video_url\":\"${VIDEO_URL}\"}" \
+            || echo "Webhook call failed (non-fatal)"

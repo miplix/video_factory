@@ -77,20 +77,39 @@ jobs:
           SLIDE_URLS: ${{ inputs.slide_urls }}
 
       - name: Generate voiceover with edge-tts
+        env:
+          VOICE_TEXT: ${{ inputs.voiceover_text }}
+          TTS_VOICE: ${{ secrets.TTS_VOICE }}
         run: |
           python3 - <<'PYEOF'
-          import os, asyncio, edge_tts
+          import os, re, asyncio, edge_tts
+
           text = os.environ.get('VOICE_TEXT', '').strip()
           if not text:
               print("No voiceover text — skipping"); exit(0)
+
+          # Last-mile TTS normalisation — belt-and-braces over what Vercel already did.
+          # Common edge-tts pitfalls on Russian: English substrings, @mentions, bare URLs.
+          text = re.sub(r'@\w+', '', text)                        # drop any @mentions
+          text = re.sub(r'\bYupSoul\b', 'юпсол', text, flags=re.I) # brand
+          text = re.sub(r'yupsoul\.(ru|online|com)', 'юпсол точка ру', text, flags=re.I)
+          text = re.sub(r'\bbot\b', '', text, flags=re.I)         # kill english "bot"
+          text = re.sub(r'\s{2,}', ' ', text).strip()
+          # Make sure the very last sentence has terminal punctuation so TTS doesn't trail off.
+          if text and text[-1] not in '.!?…':
+              text += '.'
+
+          voice = os.environ.get('TTS_VOICE') or 'ru-RU-SvetlanaNeural'
+          print(f"Voice: {voice}")
+          print(f"Text ({len(text)} chars): {text[:140]}...")
+
           async def run():
-              c = edge_tts.Communicate(text, voice="ru-RU-DmitryNeural", rate="+5%")
-              await c.save("/tmp/render/voiceover.mp3")
+              c = edge_tts.Communicate(text, voice=voice, rate='+0%', volume='+0%')
+              await c.save('/tmp/render/voiceover.mp3')
               print("✅ Voiceover generated")
+
           asyncio.run(run())
           PYEOF
-        env:
-          VOICE_TEXT: ${{ inputs.voiceover_text }}
 
       - name: Generate karaoke subtitles (Whisper word-timestamps)
         if: ${{ inputs.voiceover_text != '' }}
@@ -218,11 +237,12 @@ jobs:
           print(f"✅ Pexels clips: {len(downloaded)}")
           PYEOF
 
-      - name: Try AI-video chain (Luma → Fal → Replicate → skip)
+      - name: Try AI-video chain (Luma → Fal → Replicate → HF → skip)
         env:
           LUMA_API_KEY: ${{ secrets.LUMA_API_KEY }}
           FAL_API_KEY: ${{ secrets.FAL_API_KEY }}
           REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
+          HF_API_TOKEN: ${{ secrets.HF_API_TOKEN }}
           CAPTION: ${{ inputs.caption }}
           MUSIC_TYPE: ${{ inputs.music_type }}
         run: |
@@ -324,8 +344,33 @@ jobs:
                   print(f"[Replicate] error: {e}")
               return False
 
+          # --- 4) Hugging Face Inference (experimental, needs HF_API_TOKEN) ---
+          def try_hf():
+              tok = os.environ.get('HF_API_TOKEN', '')
+              if not tok: return False
+              # Serverless inference for T2V has been flaky in 2025.
+              # We try a known model; if 503/404 we just skip and fall back.
+              model = 'cerspense/zeroscope_v2_576w'
+              try:
+                  r = requests.post(
+                      f'https://api-inference.huggingface.co/models/{model}',
+                      headers={'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'},
+                      json={'inputs': prompt},
+                      timeout=180)
+                  if r.status_code != 200:
+                      print(f"[HF] {r.status_code}: {r.text[:200]}"); return False
+                  # HF inference may return raw video bytes OR a JSON with error
+                  ct = r.headers.get('Content-Type', '')
+                  if 'video' in ct or 'octet-stream' in ct:
+                      with open(out_path, 'wb') as f: f.write(r.content)
+                      print("✅ HF clip saved"); return True
+                  print(f"[HF] unexpected content-type: {ct}"); return False
+              except Exception as e:
+                  print(f"[HF] error: {e}")
+              return False
+
           # Chain: best quality first, skip gracefully on empty/failed.
-          for name, fn in [('Luma', try_luma), ('Fal', try_fal), ('Replicate', try_replicate)]:
+          for name, fn in [('Luma', try_luma), ('Fal', try_fal), ('Replicate', try_replicate), ('HF', try_hf)]:
               if fn():
                   print(f"🎉 Using {name} AI clip")
                   break
@@ -403,15 +448,19 @@ jobs:
               "z='if(lte(zoom,1.0),1.04,max(1.0,zoom-0.0002))'",
           ]
 
-          # Assign B-roll to middle scenes (avoid hook/CTA which should show full brand)
+          # Video-first strategy: only the CTA scene (last) stays a slide.
+          # Hook (0) = AI clip if available, else first B-roll.
+          # Middle scenes = round-robin through B-roll pool for variety.
           n = len(slides)
           broll_slots = {}  # scene_index -> broll_path
-          if broll and n > 2:
-              middle = list(range(1, n - 1))  # exclude first and last
-              random.shuffle(middle)
-              for i, idx in enumerate(middle[:min(2, len(broll))]):
-                  broll_slots[idx] = broll[i % len(broll)]
-          print(f"B-roll assigned to scenes: {sorted(broll_slots.keys())}")
+          if broll:
+              # Fill ALL non-CTA scenes with B-roll (hook gets B-roll only if no AI clip)
+              targets = list(range(0, n - 1))
+              if luma_path and 0 in targets:
+                  targets = [i for i in targets if i != 0]  # keep hook for AI
+              for k, idx in enumerate(targets):
+                  broll_slots[idx] = broll[k % len(broll)]
+          print(f"Scenes: AI=[{0 if luma_path else ''}] B-roll={sorted(broll_slots.keys())} slide=[{n-1}]")
 
           segments = []
           for i, (slide, dur) in enumerate(zip(slides, durations)):

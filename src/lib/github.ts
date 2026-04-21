@@ -8,11 +8,24 @@ import type { AppConfig, VideoJob } from './types';
 // Apply ONLY to the voiceover string — captions/titles keep proper YupSoul.
 function normalizeForTTS(text: string): string {
   return text
+    .replace(/@\S+/g, '')                                 // kill @mentions (read as letters)
     .replace(/yupsoul\.ru/gi, 'юпсол точка ру')
     .replace(/yupsoul\.online/gi, 'юпсол')
-    .replace(/@Yup[_\s-]?Soul[_\s-]?bot/gi, 'юпсол бот')
+    .replace(/yupsoul\.com/gi, 'юпсол')
+    .replace(/@?Yup[_\s-]?Soul[_\s-]?bot/gi, 'юпсол')     // drop the English "bot" suffix
     .replace(/YupSoul/g, 'юпсол')
-    .replace(/yupsoul/gi, 'юпсол');
+    .replace(/yupsoul/gi, 'юпсол')
+    .replace(/\bbot\b/gi, '')                              // catch any lingering "bot"
+    .replace(/\s+([,.!?…])/g, '$1')                       // fix floating punctuation
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+// Ensure every scene ends with proper punctuation so TTS pauses cleanly.
+function sealSentence(text: string): string {
+  const t = text.trim();
+  if (!t) return t;
+  return /[.!?…]$/.test(t) ? t : t + '.';
 }
 
 export async function triggerVideoRender(
@@ -21,9 +34,9 @@ export async function triggerVideoRender(
   webhookBaseUrl: string
 ): Promise<{ runId?: string; error?: string }> {
   // Build full voiceover text (all scenes joined), normalized for Russian TTS
-  const rawVoiceover = job.script?.scenes
-    .map(s => s.voiceover)
-    .join(' ... ') || '';
+  const rawVoiceover = (job.script?.scenes || [])
+    .map(s => sealSentence(s.voiceover))
+    .join(' ');
   const voiceoverText = normalizeForTTS(rawVoiceover);
 
   // Single Telegram caption: intro + blank line + hashtags.

@@ -78,6 +78,14 @@ function mainMenu(): InlineKeyboard {
       { text: '🎬 По рубрике', callback_data: 'menu:rubrics' },
     ],
     [{ text: '📊 Статус', callback_data: 'menu:status' }, { text: '🎞 Последнее', callback_data: 'menu:last' }],
+    [{ text: '⚙️ Настройки', callback_data: 'menu:admin' }],
+  ];
+}
+
+function adminKeyboard(): InlineKeyboard {
+  return [
+    [{ text: '🧹 R2 авто-очистка (30 дней)', callback_data: 'admin:r2' }],
+    [{ text: '← Меню', callback_data: 'menu:main' }],
   ];
 }
 
@@ -238,6 +246,40 @@ export async function POST(req: NextRequest) {
         '🔄 <b>Серия: 12 знаков</b>\n\nЗапускаю параллельно по 4 штуки с паузами.\nПервые ролики придут через ~5 минут, все 12 — в течение часа.',
       );
       if (baseUrl) after(() => triggerSeries(baseUrl, config.cronSecret));
+    } else if (data === 'menu:admin') {
+      await answerCallback(token, cb.id);
+      await reply(token, chatId, '⚙️ <b>Настройки</b>', withKeyboard(adminKeyboard()));
+    } else if (data === 'admin:r2') {
+      await answerCallback(token, cb.id, 'Настраиваю...');
+      if (!baseUrl) {
+        await reply(token, chatId, '⚠️ Не задан NEXT_PUBLIC_BASE_URL.');
+      } else {
+        after(async () => {
+          try {
+            const res = await fetch(`${baseUrl}/api/admin/setup-r2`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-cron-secret': config.cronSecret,
+              },
+            });
+            const data = await res.json();
+            if (res.ok) {
+              await reply(
+                token,
+                chatId,
+                `✅ <b>R2 авто-очистка включена</b>\n\nБакет: <code>${data.bucket}</code>\nTTL: ${data.days} дней\n\nВидео и слайды старше ${data.days} дней будут удаляться автоматически.`,
+              );
+            } else {
+              await reply(token, chatId, `⚠️ Ошибка: ${data.error || 'unknown'}`);
+            }
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            await reply(token, chatId, `⚠️ Не удалось: ${msg}`);
+          }
+        });
+        await reply(token, chatId, '⏳ Настраиваю lifecycle на R2...');
+      }
     } else if (data.startsWith('sign:')) {
       const sign = data.slice(5) as ZodiacSign;
       await answerCallback(token, cb.id, `Знак: ${ZODIAC_RU[sign] || sign}`);

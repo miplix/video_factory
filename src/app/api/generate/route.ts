@@ -1,10 +1,10 @@
 // POST /api/generate
-// Triggers full pipeline: script → slides → voiceover → R2 upload → GitHub Actions render
+// Pipeline: script (LLM) → slides (Satori) → R2 upload → GitHub Actions
+// TTS moved to GitHub Actions (edge-tts, free Microsoft Neural TTS)
 import { NextRequest, NextResponse } from 'next/server';
 import { loadConfig } from '@/lib/config';
 import { generateVideoScript, pickRandomTopic } from '@/lib/generators/script';
 import { renderAllSlides } from '@/lib/generators/slides';
-import { generateVoiceover } from '@/lib/generators/voiceover';
 import { uploadBuffer } from '@/lib/storage/r2';
 import { triggerVideoRender } from '@/lib/github';
 import { saveJob, generateId } from '@/lib/db';
@@ -16,7 +16,6 @@ export const maxDuration = 60;
 export async function POST(req: NextRequest) {
   const config = loadConfig();
 
-  // Verify cron or admin auth
   const auth = req.headers.get('authorization') || req.headers.get('x-admin-key');
   const isCron = req.headers.get('x-cron-secret') === config.cronSecret;
   if (!isCron && auth !== `Bearer ${config.cronSecret}`) {
@@ -24,7 +23,7 @@ export async function POST(req: NextRequest) {
   }
 
   let body: { zodiacSign?: string; zodiacSign2?: string; rubric?: string } = {};
-  try { body = await req.json(); } catch { /* no body = use random */ }
+  try { body = await req.json(); } catch { /* random topic */ }
 
   const topic = body.zodiacSign
     ? {
@@ -51,8 +50,6 @@ export async function POST(req: NextRequest) {
 
   try {
     // 1. Generate script
-    job.status = 'generating_script';
-    await saveJob(config, job);
     const script = await generateVideoScript({
       zodiacSign: topic.zodiacSign,
       zodiacSign2: topic.zodiacSign2,
@@ -68,12 +65,7 @@ export async function POST(req: NextRequest) {
     await saveJob(config, job);
     const slideBuffers = await renderAllSlides(script.scenes, script.zodiacSign, script.zodiacSign2);
 
-    // 3. Generate voiceover
-    job.status = 'generating_voice';
-    await saveJob(config, job);
-    const audioBuffer = await generateVoiceover(script.scenes, config);
-
-    // 4. Upload slides + audio to R2
+    // 3. Upload slides to R2
     job.status = 'uploading';
     await saveJob(config, job);
 
@@ -84,19 +76,16 @@ export async function POST(req: NextRequest) {
       slideUrls.push(url);
     }
 
-    const audioKey = `jobs/${jobId}/voiceover.mp3`;
-    const audioUrl = await uploadBuffer(config, audioKey, audioBuffer, 'audio/mpeg');
-
     job.slideUrls = slideUrls;
-    job.audioUrl = audioUrl;
+    // voiceover text passed to GitHub Actions for edge-tts (free, no API key)
+    job.audioUrl = '';
 
-    // 5. Trigger GitHub Actions render
+    // 4. Trigger GitHub Actions (TTS + ffmpeg assembly)
     job.status = 'rendering_video';
     await saveJob(config, job);
 
-    const baseUrl = process.env.VERCEL_URL
-      ? `https://${process.env.VERCEL_URL}`
-      : (process.env.NEXT_PUBLIC_BASE_URL || 'https://localhost:3000');
+    const baseUrl = process.env.NEXT_PUBLIC_BASE_URL
+      || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://localhost:3000');
 
     const { runId, error: ghError } = await triggerVideoRender(job, config, baseUrl);
 
@@ -115,11 +104,7 @@ export async function POST(req: NextRequest) {
       jobId,
       status: 'rendering_video',
       githubRunId: runId,
-      script: {
-        title: script.title,
-        totalDuration: script.totalDuration,
-        scenes: script.scenes.length,
-      },
+      script: { title: script.title, totalDuration: script.totalDuration, scenes: script.scenes.length },
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

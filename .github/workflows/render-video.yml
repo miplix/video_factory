@@ -141,6 +141,27 @@ jobs:
           while len(durations) < len(slides):
               durations.append(4)
 
+          # --- Safety net: measure actual voiceover duration.
+          # If total video < voice + 1.5s tail, extend the last scene so speech never cuts off.
+          voice_path = '/tmp/render/voiceover.mp3'
+          if os.path.exists(voice_path):
+              try:
+                  out = subprocess.check_output([
+                      'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                      '-of', 'default=noprint_wrappers=1:nokey=1', voice_path,
+                  ], text=True).strip()
+                  voice_dur = float(out)
+                  video_dur = sum(durations)
+                  target = voice_dur + 1.5
+                  if video_dur < target:
+                      extra = target - video_dur
+                      durations[-1] = durations[-1] + extra
+                      print(f"⚙ Extended last scene by {extra:.2f}s (voice={voice_dur:.2f}s, video was {video_dur:.2f}s)")
+                  else:
+                      print(f"✓ Video {video_dur:.2f}s fits voice {voice_dur:.2f}s")
+              except Exception as e:
+                  print(f"⚠ Voice-duration probe failed: {e}")
+
           # Ken Burns zoom variants per slide
           zoom_configs = [
               "z='min(zoom+0.0003,1.05)'",  # slow zoom in

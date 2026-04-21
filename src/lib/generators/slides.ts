@@ -78,6 +78,11 @@ function starField(sceneIndex: number): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1920" style="position:absolute;top:0;left:0">${stars.join('')}</svg>`;
 }
 
+const BRAND_NAME = 'YupSoul';
+const BRAND_SITE_HOST = (process.env.BRAND_SITE_URL || 'https://yupsoul.ru')
+  .replace(/^https?:\/\//, '')
+  .replace(/\/$/, '');
+
 export interface RenderSlideOptions {
   scene: VideoScene;
   sceneIndex: number;
@@ -274,6 +279,41 @@ export async function renderSlide(opts: RenderSlideOptions): Promise<Buffer> {
           },
         },
 
+        // Brand header — top-left on EVERY slide
+        {
+          type: 'div',
+          props: {
+            style: {
+              position: 'absolute',
+              top: 70,
+              left: 60,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 14,
+              fontSize: 38,
+              fontWeight: 700,
+              color: COLORS.starWhite,
+              letterSpacing: 2,
+              textTransform: 'uppercase',
+            },
+            children: [
+              {
+                type: 'div',
+                props: {
+                  style: {
+                    width: 12,
+                    height: 12,
+                    borderRadius: 6,
+                    background: accent,
+                    boxShadow: `0 0 12px ${accent}`,
+                  },
+                },
+              },
+              BRAND_NAME,
+            ],
+          },
+        },
+
         // CTA footer
         isCTA ? {
           type: 'div',
@@ -303,7 +343,7 @@ export async function renderSlide(opts: RenderSlideOptions): Promise<Buffer> {
                     fontWeight: 700,
                     color: COLORS.deepSpace,
                   },
-                  children: 'yupsoul.online',
+                  children: BRAND_SITE_HOST,
                 },
               },
               {
@@ -320,7 +360,7 @@ export async function renderSlide(opts: RenderSlideOptions): Promise<Buffer> {
           },
         } : null,
 
-        // Brand watermark (non-CTA slides)
+        // Site URL watermark (non-CTA slides)
         !isCTA ? {
           type: 'div',
           props: {
@@ -328,12 +368,12 @@ export async function renderSlide(opts: RenderSlideOptions): Promise<Buffer> {
               position: 'absolute',
               bottom: 60,
               right: 60,
-              fontSize: 32,
+              fontSize: 30,
               fontWeight: 600,
-              color: `${accent}88`,
+              color: `${accent}99`,
               letterSpacing: 1,
             },
-            children: 'yupsoul.online',
+            children: BRAND_SITE_HOST,
           },
         } : null,
       ].filter(Boolean),

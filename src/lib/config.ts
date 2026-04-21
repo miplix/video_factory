@@ -15,7 +15,7 @@ export function loadConfig(): AppConfig {
     brand: {
       name: env('BRAND_NAME', 'YupSoul'),
       botUrl: env('BRAND_BOT_URL', 'https://t.me/Yup_Soul_bot'),
-      siteUrl: env('BRAND_SITE_URL', 'https://www.yupsoul.online'),
+      siteUrl: env('BRAND_SITE_URL', 'https://yupsoul.ru'),
       language: (env('BRAND_LANGUAGE', 'ru') as 'ru' | 'en'),
     },
     llm: {

@@ -51,7 +51,8 @@ export type ContentRubric =
   | 'backstage_ai'
   | 'astro_facts'
   | 'gift'
-  | 'tutorial';
+  | 'tutorial'
+  | 'brand_sounds';
 
 export const RUBRIC_RU: Record<ContentRubric, string> = {
   zodiac_sound: 'Звук твоего знака',
@@ -65,6 +66,7 @@ export const RUBRIC_RU: Record<ContentRubric, string> = {
   astro_facts: 'Астро-факты',
   gift: 'Подарок',
   tutorial: 'Как это работает',
+  brand_sounds: 'Звук брендов',
 };
 
 // --- Video Scene ---
@@ -130,6 +132,7 @@ export interface VideoJob {
   error?: string;
   githubRunId?: string;
   scheduledAt?: string;
+  retryCount?: number; // auto-retry counter, 0 on first run
 }
 
 // --- Config ---

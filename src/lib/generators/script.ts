@@ -7,6 +7,7 @@ import type { AppConfig, VideoScript, VideoScene, ZodiacSign, ContentRubric } fr
 import { ZODIAC_RU, ZODIAC_EMOJI, RUBRIC_RU, ZODIAC_DATES } from '../types';
 import { getActiveLLMProvider } from '../config';
 import { pickCelebrities } from '../data/celebrities';
+import { pickBrands } from '../data/brands';
 
 // Russian TTS (edge-tts, rate +5%) reads ~15 chars/sec incl. pauses
 const CHARS_PER_SEC = 14;
@@ -29,25 +30,109 @@ export async function generateVideoScript(opts: ScriptGenOptions): Promise<Video
   const provider = getActiveLLMProvider(opts.config);
   if (!provider) throw new Error('No LLM provider configured');
 
-  const prompt = buildPrompt(opts);
-  const systemPrompt = buildSystemPrompt(opts.config);
+  // Up to 2 tries: generate → LLM self-review → regenerate once if score < 7.
+  let best: VideoScript | null = null;
+  let bestScore = 0;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const prompt = buildPrompt(opts);
+    const systemPrompt = buildSystemPrompt(opts.config);
+
+    let raw: string;
+    switch (provider) {
+      case 'gemini': raw = await callGemini(prompt, systemPrompt, opts.config); break;
+      case 'deepseek': raw = await callDeepSeek(prompt, systemPrompt, opts.config); break;
+      case 'anthropic': raw = await callAnthropic(prompt, systemPrompt, opts.config); break;
+      default: throw new Error(`Unknown provider: ${provider}`);
+    }
+    const script = parseScript(raw, opts);
+
+    // Quality gate: only spend a second LLM call on attempt 1.
+    if (attempt === 1) {
+      try {
+        const review = await reviewScript(script, opts);
+        console.log(`[script-review] attempt ${attempt} score=${review.score}/10 issues=${review.issues.join('; ') || 'none'}`);
+        if (!best || review.score > bestScore) {
+          best = script;
+          bestScore = review.score;
+        }
+        if (review.score >= 7) return script; // good enough
+        // otherwise regenerate
+      } catch (e) {
+        console.log(`[script-review] failed, accepting attempt 1: ${e}`);
+        return script;
+      }
+    } else {
+      // second attempt: accept whichever is better
+      try {
+        const review = await reviewScript(script, opts);
+        console.log(`[script-review] attempt ${attempt} score=${review.score}/10`);
+        if (review.score > bestScore) return script;
+      } catch { /* ignore */ }
+      return best || script;
+    }
+  }
+  return best!;
+}
+
+interface ScriptReview {
+  score: number;   // 0-10
+  issues: string[];
+}
+
+async function reviewScript(script: VideoScript, opts: ScriptGenOptions): Promise<ScriptReview> {
+  const provider = getActiveLLMProvider(opts.config);
+  if (!provider) return { score: 10, issues: [] };
+
+  const reviewSystem = `Ты — строгий редактор вирусного TikTok-контента. Проверяешь сценарии по критериям:
+1. Первая сцена — сильный хук (есть ли крючок в первые 1.5с?)
+2. Нет канцелярита, живой разговорный русский
+3. Voiceover укладывается в длительность сцены (~14 симв/сек)
+4. Нет повторов, нет дженерик-фраз («дорогой друг», «в этом видео»)
+5. Финал даёт чёткий CTA
+6. Caption цепляющий, не сухой
+7. Hashtags: смесь трендов + нишевых
+
+Возвращай ТОЛЬКО JSON: {"score": 0-10, "issues": ["..."]}`;
+
+  const reviewPrompt = `Оцени этот сценарий:
+
+Рубрика: ${RUBRIC_RU[script.rubric]}
+${script.zodiacSign ? `Знак: ${ZODIAC_RU[script.zodiacSign]}` : ''}
+
+${script.scenes.map((s, i) =>
+  `Сцена ${i + 1} (${s.duration}с)${s.isHook ? ' [ХУК]' : ''}${s.isCTA ? ' [CTA]' : ''}:
+  heading: ${s.heading}
+  body: ${s.body || '—'}
+  voiceover: ${s.voiceover} (${s.voiceover.length} симв)`
+).join('\n')}
+
+Caption: ${script.caption}
+Hashtags: ${script.hashtags.join(' ')}
+
+Верни JSON со score и list of issues.`;
 
   let raw: string;
-  switch (provider) {
-    case 'gemini':
-      raw = await callGemini(prompt, systemPrompt, opts.config);
-      break;
-    case 'deepseek':
-      raw = await callDeepSeek(prompt, systemPrompt, opts.config);
-      break;
-    case 'anthropic':
-      raw = await callAnthropic(prompt, systemPrompt, opts.config);
-      break;
-    default:
-      throw new Error(`Unknown provider: ${provider}`);
+  try {
+    switch (provider) {
+      case 'gemini': raw = await callGemini(reviewPrompt, reviewSystem, opts.config); break;
+      case 'deepseek': raw = await callDeepSeek(reviewPrompt, reviewSystem, opts.config); break;
+      case 'anthropic': raw = await callAnthropic(reviewPrompt, reviewSystem, opts.config); break;
+      default: return { score: 10, issues: [] };
+    }
+  } catch {
+    return { score: 10, issues: [] };
   }
 
-  return parseScript(raw, opts);
+  let json = raw.trim().replace(/^```[a-z]*\n?/, '').replace(/\n?```$/, '');
+  try {
+    const parsed = JSON.parse(json);
+    return {
+      score: Math.max(0, Math.min(10, Number(parsed.score) || 0)),
+      issues: Array.isArray(parsed.issues) ? parsed.issues.slice(0, 5).map(String) : [],
+    };
+  } catch {
+    return { score: 10, issues: [] };
+  }
 }
 
 function buildSystemPrompt(config: AppConfig): string {
@@ -129,6 +214,20 @@ ${list}
       topicDesc = `Пошаговая инструкция: как получить персональный трек на ${opts.config?.brand?.name || 'YupSoul'}. 3-4 шага максимум. Обещание результата в финале.`;
       hookHint = `Хук: «За 60 секунд у тебя будет трек, который звучит ТОЛЬКО как ты»`;
       break;
+    case 'brand_sounds': {
+      const brands = pickBrands(4);
+      const list = brands.map((b) => `— ${b.ru}: ${b.vibe}`).join('\n');
+      topicDesc = `Если бы мировые бренды были треками — как бы они звучали?
+Возьми 3-4 бренда ТОЛЬКО из списка ниже и опиши их звук (каждому — 4-6 секунд в сцене).
+Финал: «У тебя тоже есть свой звук — создай его в юпсол».
+
+ДОСТУПНЫЕ БРЕНДЫ:
+${list}
+
+НЕ связывай это со знаками зодиака — тут только стиль брендов.`;
+      hookHint = `Хук: «Если бы ${brands[0]?.ru || 'бренды'} был треком — он звучал бы вот так...»`;
+      break;
+    }
   }
 
   const sign1Text = sign1Ru ? `${sign1Ru} ${sign1Em}` : '';
@@ -331,6 +430,7 @@ export function pickRandomTopic(usedPairs?: Set<string>): {
   const rubrics: ContentRubric[] = [
     'zodiac_sound', 'compatibility', 'zodiac_memes', 'zodiac_battle',
     'signs_as_genres', 'celebrities', 'astro_facts', 'backstage_ai', 'gift', 'tutorial',
+    'brand_sounds',
   ];
 
   const rubric = rubrics[Math.floor(Math.random() * rubrics.length)];
@@ -342,7 +442,7 @@ export function pickRandomTopic(usedPairs?: Set<string>): {
     return { zodiacSign: sign1, zodiacSign2: sign2, rubric };
   }
 
-  if (rubric === 'signs_as_genres') {
+  if (rubric === 'signs_as_genres' || rubric === 'brand_sounds') {
     return { rubric };
   }
 

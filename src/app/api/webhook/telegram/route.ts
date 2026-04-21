@@ -85,6 +85,7 @@ function rubricsKeyboard(): InlineKeyboard {
     'zodiac_battle',
     'signs_as_genres',
     'celebrities',
+    'brand_sounds',
     'daily_energy',
     'astro_facts',
     'backstage_ai',
@@ -184,12 +185,15 @@ export async function POST(req: NextRequest) {
       const rubric = data.slice(7) as ContentRubric;
       await answerCallback(token, cb.id, `Рубрика: ${RUBRIC_RU[rubric] || rubric}`);
       await sendTyping(token, chatId);
+      const noSigns = rubric === 'brand_sounds' || rubric === 'signs_as_genres';
       const needsPair = rubric === 'compatibility' || rubric === 'zodiac_battle';
-      const sign1 = pickRandomSign();
+      const sign1 = noSigns ? undefined : pickRandomSign();
       const sign2 = needsPair ? pickRandomSign(sign1) : undefined;
-      const desc = needsPair
-        ? `${ZODIAC_RU[sign1]} × ${ZODIAC_RU[sign2!]}`
-        : ZODIAC_RU[sign1];
+      const desc = noSigns
+        ? '—'
+        : needsPair
+          ? `${ZODIAC_RU[sign1!]} × ${ZODIAC_RU[sign2!]}`
+          : ZODIAC_RU[sign1!];
       await reply(
         token,
         chatId,

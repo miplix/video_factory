@@ -6,6 +6,7 @@
 import type { AppConfig, VideoScript, VideoScene, ZodiacSign, ContentRubric } from '../types';
 import { ZODIAC_RU, ZODIAC_EMOJI, RUBRIC_RU, ZODIAC_DATES } from '../types';
 import { getActiveLLMProvider } from '../config';
+import { pickCelebrities } from '../data/celebrities';
 
 // Russian TTS (edge-tts, rate +5%) reads ~15 chars/sec incl. pauses
 const CHARS_PER_SEC = 14;
@@ -93,10 +94,17 @@ function buildPrompt(opts: ScriptGenOptions): string {
       topicDesc = `Батл: ${sign1Ru} VS ${sign2Ru}. Формат: сравнение «звуков» 3-4 раундами (энергия / ритм / настроение / финал). Выбери победителя с подколом.`;
       hookHint = `Хук: «${sign1Ru} против ${sign2Ru}. Чей бит громче?»`;
       break;
-    case 'celebrities':
-      topicDesc = `Как звучала бы персональная мелодия знаменитости со знаком ${sign1Ru}. Возьми реальную известную личность этого знака, опиши его/её «звук души». Заверши идеей: «твоя персональная мелодия такая же уникальная».`;
-      hookHint = `Хук: «Знаешь, какой трек описал бы [имя звезды]-${sign1Ru}?»`;
+    case 'celebrities': {
+      const picks = opts.zodiacSign ? pickCelebrities(opts.zodiacSign, 3) : [];
+      const list = picks.map((p) => `— ${p.ru} (${p.dob})`).join('\n');
+      topicDesc = `Как звучала бы персональная мелодия знаменитости со знаком ${sign1Ru}. Опиши «звук души» этой звезды. Заверши идеей: «твоя персональная мелодия такая же уникальная».
+
+КРИТИЧНО: используй ИМЯ ТОЛЬКО из этого списка (все реально ${sign1Ru}):
+${list}
+Если возьмёшь имя не из списка — это будет фактическая ошибка, такое недопустимо.`;
+      hookHint = `Хук: «Знаешь, как звучал бы трек ${picks[0]?.ru || 'этой звезды'}?»`;
       break;
+    }
     case 'signs_as_genres':
       topicDesc = `Все 12 знаков как музыкальные жанры. По 2-3 секунды на знак. Короткие, хлёсткие ассоциации: «Овен — панк-рок», «Рыбы — ambient»... Не перечисление, а стендап-подача.`;
       hookHint = `Хук: «12 знаков зодиака — и каждый это отдельный жанр»`;

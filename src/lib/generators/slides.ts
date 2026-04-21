@@ -28,6 +28,41 @@ const COLORS = {
 let _fontRegular: ArrayBuffer | null = null;
 let _fontBold: ArrayBuffer | null = null;
 
+// --- Emoji support via twemoji SVG CDN ----------------------------------
+// Satori ships without emoji glyphs. When it encounters an emoji grapheme,
+// it calls loadAdditionalAsset(code='emoji', segment=emoji).
+// We resolve the grapheme to the matching twemoji SVG and return a data URL.
+const _emojiCache = new Map<string, string>();
+
+function emojiToTwemojiHex(emoji: string): string {
+  const cps: string[] = [];
+  for (const ch of [...emoji]) {
+    const cp = ch.codePointAt(0);
+    if (!cp) continue;
+    if (cp === 0xfe0f) continue; // skip variation selector-16 (twemoji omits it)
+    cps.push(cp.toString(16));
+  }
+  return cps.join('-');
+}
+
+async function loadEmojiAsset(code: string, segment: string): Promise<string> {
+  if (code !== 'emoji') return segment;
+  if (_emojiCache.has(segment)) return _emojiCache.get(segment)!;
+  const hex = emojiToTwemojiHex(segment);
+  if (!hex) return segment;
+  try {
+    const url = `https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/svg/${hex}.svg`;
+    const res = await fetch(url);
+    if (!res.ok) return segment;
+    const svg = await res.text();
+    const dataUrl = `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
+    _emojiCache.set(segment, dataUrl);
+    return dataUrl;
+  } catch {
+    return segment;
+  }
+}
+
 function loadFonts() {
   if (_fontRegular && _fontBold) return { regular: _fontRegular, bold: _fontBold };
 
@@ -387,6 +422,7 @@ export async function renderSlide(opts: RenderSlideOptions): Promise<Buffer> {
       { name: 'Inter', data: fonts.regular, weight: 400, style: 'normal' },
       { name: 'Inter', data: fonts.bold, weight: 700, style: 'normal' },
     ],
+    loadAdditionalAsset: loadEmojiAsset,
   });
 
   const resvg = new Resvg(svg, {

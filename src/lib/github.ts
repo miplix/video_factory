@@ -4,15 +4,27 @@
 // ============================================================
 import type { AppConfig, VideoJob } from './types';
 
+// TTS normalisation: English brand spelling breaks Russian edge-tts pronunciation.
+// Apply ONLY to the voiceover string — captions/titles keep proper YupSoul.
+function normalizeForTTS(text: string): string {
+  return text
+    .replace(/yupsoul\.ru/gi, 'юпсол точка ру')
+    .replace(/yupsoul\.online/gi, 'юпсол')
+    .replace(/@Yup[_\s-]?Soul[_\s-]?bot/gi, 'юпсол бот')
+    .replace(/YupSoul/g, 'юпсол')
+    .replace(/yupsoul/gi, 'юпсол');
+}
+
 export async function triggerVideoRender(
   job: VideoJob,
   config: AppConfig,
   webhookBaseUrl: string
 ): Promise<{ runId?: string; error?: string }> {
-  // Build full voiceover text (all scenes joined)
-  const voiceoverText = job.script?.scenes
+  // Build full voiceover text (all scenes joined), normalized for Russian TTS
+  const rawVoiceover = job.script?.scenes
     .map(s => s.voiceover)
     .join(' ... ') || '';
+  const voiceoverText = normalizeForTTS(rawVoiceover);
 
   const url = `https://api.github.com/repos/${config.github.owner}/${config.github.repo}/actions/workflows/${config.github.workflow}/dispatches`;
 

@@ -218,62 +218,119 @@ jobs:
           print(f"✅ Pexels clips: {len(downloaded)}")
           PYEOF
 
-      - name: Try Luma AI video (optional, graceful fallback to B-roll/slide)
+      - name: Try AI-video chain (Luma → Fal → Replicate → skip)
         env:
           LUMA_API_KEY: ${{ secrets.LUMA_API_KEY }}
+          FAL_API_KEY: ${{ secrets.FAL_API_KEY }}
+          REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
           CAPTION: ${{ inputs.caption }}
           MUSIC_TYPE: ${{ inputs.music_type }}
         run: |
-          if [ -z "$LUMA_API_KEY" ]; then
-            echo "LUMA_API_KEY not set — skipping Luma AI (free fallback: Pexels/slide Ken Burns)"
-            exit 0
-          fi
           python3 - <<'PYEOF'
           import os, time, requests
-          key = os.environ['LUMA_API_KEY']
+
           music = os.environ.get('MUSIC_TYPE', 'cosmic_ambient')
-          prompt_map = {
-              'cosmic_ambient': 'ethereal cosmic nebula, purple and gold stardust floating in slow motion, cinematic, 9:16',
-              'energetic':      'neon light streaks, vibrant pink and blue, abstract motion, cinematic, 9:16',
-              'mystical':       'mystical forest with golden light rays, slow camera push, cinematic, 9:16',
-              'upbeat':         'colorful confetti falling slow motion against gradient sky, cinematic, 9:16',
+          PROMPTS = {
+              'cosmic_ambient': 'ethereal cosmic nebula, purple and gold stardust floating slow motion, cinematic, vertical 9:16',
+              'energetic':      'neon light streaks, vibrant pink and blue, abstract motion, cinematic, vertical 9:16',
+              'mystical':       'mystical forest with golden light rays, slow dolly in, cinematic, vertical 9:16',
+              'upbeat':         'colorful confetti falling in slow motion against gradient sky, cinematic, vertical 9:16',
           }
-          prompt = prompt_map.get(music, prompt_map['cosmic_ambient'])
-          try:
-              r = requests.post(
-                  'https://api.lumalabs.ai/dream-machine/v1/generations',
-                  headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
-                  json={'prompt': prompt, 'aspect_ratio': '9:16', 'loop': False},
-                  timeout=30,
-              )
-              r.raise_for_status()
-              gen_id = r.json()['id']
-              print(f"Luma job: {gen_id}")
-              # Poll up to 3 min
-              for _ in range(36):
-                  time.sleep(5)
-                  s = requests.get(
-                      f'https://api.lumalabs.ai/dream-machine/v1/generations/{gen_id}',
-                      headers={'Authorization': f'Bearer {key}'}, timeout=15,
-                  )
-                  s.raise_for_status()
-                  d = s.json()
-                  state = d.get('state', 'unknown')
-                  print(f"  state={state}")
-                  if state == 'completed':
-                      url = d['assets']['video']
-                      with requests.get(url, stream=True, timeout=60) as resp:
-                          resp.raise_for_status()
-                          with open('/tmp/render/luma.mp4', 'wb') as out:
-                              for chunk in resp.iter_content(8192):
-                                  out.write(chunk)
-                      print("✅ Luma clip saved"); break
-                  if state == 'failed':
-                      print(f"Luma failed: {d.get('failure_reason', '?')}"); break
-              else:
-                  print("Luma timed out — falling back")
-          except Exception as e:
-              print(f"⚠ Luma skipped: {e}")
+          prompt = PROMPTS.get(music, PROMPTS['cosmic_ambient'])
+          out_path = '/tmp/render/luma.mp4'   # kept name for downstream
+
+          def save(url):
+              with requests.get(url, stream=True, timeout=90) as r:
+                  r.raise_for_status()
+                  with open(out_path, 'wb') as f:
+                      for ch in r.iter_content(8192): f.write(ch)
+              print(f"✅ AI clip saved → {out_path}")
+
+          # --- 1) Luma Dream Machine ---------------------------------------
+          def try_luma():
+              key = os.environ.get('LUMA_API_KEY', '')
+              if not key: return False
+              try:
+                  r = requests.post(
+                      'https://api.lumalabs.ai/dream-machine/v1/generations',
+                      headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
+                      json={'prompt': prompt, 'aspect_ratio': '9:16', 'loop': False},
+                      timeout=30)
+                  r.raise_for_status()
+                  gid = r.json()['id']; print(f"[Luma] job {gid}")
+                  for _ in range(36):
+                      time.sleep(5)
+                      d = requests.get(
+                          f'https://api.lumalabs.ai/dream-machine/v1/generations/{gid}',
+                          headers={'Authorization': f'Bearer {key}'}, timeout=15).json()
+                      st = d.get('state', '?'); print(f"  [Luma] {st}")
+                      if st == 'completed':
+                          save(d['assets']['video']); return True
+                      if st == 'failed':
+                          print(f"  [Luma] failed: {d.get('failure_reason','?')}"); return False
+                  print("[Luma] timeout")
+              except Exception as e:
+                  print(f"[Luma] error: {e}")
+              return False
+
+          # --- 2) Fal.ai (LTX-Video, fast + cheap) -------------------------
+          def try_fal():
+              key = os.environ.get('FAL_API_KEY', '')
+              if not key: return False
+              try:
+                  r = requests.post(
+                      'https://fal.run/fal-ai/ltx-video',
+                      headers={'Authorization': f'Key {key}', 'Content-Type': 'application/json'},
+                      json={'prompt': prompt, 'aspect_ratio': '9:16'},
+                      timeout=180)
+                  r.raise_for_status()
+                  data = r.json()
+                  vid = (data.get('video') or {}).get('url') or data.get('video_url')
+                  if not vid:
+                      print(f"[Fal] no video URL in response: {data}"); return False
+                  save(vid); return True
+              except Exception as e:
+                  print(f"[Fal] error: {e}")
+              return False
+
+          # --- 3) Replicate (zeroscope-v2-xl, slower but works) ------------
+          def try_replicate():
+              tok = os.environ.get('REPLICATE_API_TOKEN', '')
+              if not tok: return False
+              try:
+                  # zeroscope v2 XL version hash (stable)
+                  version = '9f747673945c62801b13b84701c783929c0ee784e4748ec062204894dda1a351'
+                  r = requests.post(
+                      'https://api.replicate.com/v1/predictions',
+                      headers={'Authorization': f'Token {tok}', 'Content-Type': 'application/json'},
+                      json={'version': version, 'input': {'prompt': prompt, 'num_frames': 60}},
+                      timeout=30)
+                  r.raise_for_status()
+                  pid = r.json()['id']; print(f"[Replicate] job {pid}")
+                  for _ in range(60):
+                      time.sleep(5)
+                      d = requests.get(
+                          f'https://api.replicate.com/v1/predictions/{pid}',
+                          headers={'Authorization': f'Token {tok}'}, timeout=15).json()
+                      st = d.get('status', '?'); print(f"  [Replicate] {st}")
+                      if st == 'succeeded':
+                          url = d.get('output')
+                          if isinstance(url, list): url = url[0]
+                          if url: save(url); return True
+                      if st in ('failed', 'canceled'):
+                          print(f"  [Replicate] {st}: {d.get('error','?')}"); return False
+                  print("[Replicate] timeout")
+              except Exception as e:
+                  print(f"[Replicate] error: {e}")
+              return False
+
+          # Chain: best quality first, skip gracefully on empty/failed.
+          for name, fn in [('Luma', try_luma), ('Fal', try_fal), ('Replicate', try_replicate)]:
+              if fn():
+                  print(f"🎉 Using {name} AI clip")
+                  break
+          else:
+              print("↪ No AI-video provider succeeded — pipeline falls back to Pexels/slide")
           PYEOF
 
       - name: Generate background music
@@ -464,27 +521,33 @@ jobs:
           IN=/tmp/render/video_stitched.mp4
           OUT=/tmp/render/video_final.mp4
 
+          # Waveform style:
+          #  - 240px tall, p2p mode (smoother than cline)
+          #  - sqrt amplitude scale (tiny syllables stay visible)
+          #  - gblur for soft, solid line look (no sharp edges)
+          #  - purple→gold gradient, ~1s window per frame (rate=25)
+          #  - amix of voice boosted 3× before viz → "zoom in" feel
+          WAVE_FILTER="[1:a]volume=3,showwaves=s=1080x240:mode=p2p:rate=25:scale=sqrt:colors=0xB794F6|0xF6D56B,format=rgba,colorkey=0x000000:0.02:0,gblur=sigma=1.8[wave]"
+          # overlay at y=H-470 → waveform vertical center ≈ H-350 (same zone as subs)
+          WAVE_OVERLAY="[0:v][wave]overlay=0:H-470:format=auto[vw]"
+          SUBS_FILTER="[vw]subtitles=/tmp/render/karaoke.ass:fontsdir=/tmp/render/fonts[vout]"
+
           if [ "$HAVE_SUBS" = "yes" ] && [ "$HAVE_VOICE" = "yes" ]; then
-            # Burn subtitles + overlay showwaves waveform above karaoke
+            # Order matters: waveform first, subtitles burned ON TOP so text is readable.
             ffmpeg -y -i "$IN" -i /tmp/render/voiceover.mp3 \
-              -filter_complex "\
-                [0:v]subtitles=/tmp/render/karaoke.ass:fontsdir=/tmp/render/fonts[vs];\
-                [1:a]showwaves=s=1080x80:mode=cline:colors=0xB794F6|0xD4A574:rate=30,format=rgba,colorkey=black:0.01:0[wave];\
-                [vs][wave]overlay=0:H-460:format=auto[vout]" \
+              -filter_complex "${WAVE_FILTER};${WAVE_OVERLAY};${SUBS_FILTER}" \
               -map "[vout]" -c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p -an \
-              "$OUT" && echo "✅ Karaoke + waveform burned in"
+              "$OUT" && echo "✅ Waveform + karaoke (subs on top)"
           elif [ "$HAVE_SUBS" = "yes" ]; then
             ffmpeg -y -i "$IN" \
               -vf "subtitles=/tmp/render/karaoke.ass:fontsdir=/tmp/render/fonts" \
               -c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p -an \
-              "$OUT" && echo "✅ Karaoke burned in"
+              "$OUT" && echo "✅ Karaoke only"
           elif [ "$HAVE_VOICE" = "yes" ]; then
             ffmpeg -y -i "$IN" -i /tmp/render/voiceover.mp3 \
-              -filter_complex "\
-                [1:a]showwaves=s=1080x80:mode=cline:colors=0xB794F6|0xD4A574:rate=30,format=rgba,colorkey=black:0.01:0[wave];\
-                [0:v][wave]overlay=0:H-380:format=auto[vout]" \
+              -filter_complex "${WAVE_FILTER};${WAVE_OVERLAY};[vw]null[vout]" \
               -map "[vout]" -c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p -an \
-              "$OUT" && echo "✅ Waveform overlaid"
+              "$OUT" && echo "✅ Waveform only"
           else
             cp "$IN" "$OUT"
             echo "No subs/voice overlays — video passed through"

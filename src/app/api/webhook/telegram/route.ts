@@ -1,7 +1,7 @@
 // Telegram bot webhook handler
 // Commands: /start /generate /status /help
 // Register webhook: https://api.telegram.org/bot{TOKEN}/setWebhook?url={VERCEL_URL}/api/webhook/telegram
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest, NextResponse, after } from 'next/server';
 import { loadConfig } from '@/lib/config';
 import { getJobs } from '@/lib/db';
 import { ZODIAC_RU, ZODIAC_EMOJI } from '@/lib/types';
@@ -63,15 +63,16 @@ export async function POST(req: NextRequest) {
     await sendTyping(token, chatId);
     await reply(token, chatId, '⚙️ Запускаю генерацию видео...\n\nВидео придёт сюда через ~5 минут.');
 
-    // Trigger generation in background (fire and forget)
-    fetch(`${baseUrl}/api/generate`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-cron-secret': config.cronSecret,
-      },
-      body: JSON.stringify({}),
-    }).catch(() => {});
+    after(async () => {
+      await fetch(`${baseUrl}/api/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-cron-secret': config.cronSecret,
+        },
+        body: JSON.stringify({}),
+      });
+    });
 
   } else if (command === '/status') {
     const jobs = await getJobs(config, 5);

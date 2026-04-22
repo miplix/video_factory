@@ -407,27 +407,92 @@ jobs:
               print("↪ No AI-video provider succeeded — pipeline falls back to Pexels/slide")
           PYEOF
 
-      - name: Generate background music
+      - name: Fetch trending track (Freesound) or generate synth
+        env:
+          DURATIONS: ${{ inputs.scene_durations }}
+          MUSIC_TYPE: ${{ inputs.music_type }}
+          FREESOUND_API_KEY: ${{ secrets.FREESOUND_API_KEY }}
         run: |
           DURATION=$(python3 -c "
           import json, os
           d = json.loads(os.environ.get('DURATIONS','[4,4,4,4,4,4]'))
           print(sum(d) + 8)
           ")
-          ffmpeg -y \
-            -f lavfi -i "aevalsrc=0.10*sin(528*2*PI*t)+0.06*sin(1056*2*PI*t)+0.04*sin(396*2*PI*t):s=44100" \
-            -f lavfi -i "aevalsrc=0.06*sin(174*2*PI*t)+0.04*sin(285*2*PI*t):s=44100" \
-            -filter_complex "[0:a][1:a]amix=inputs=2:duration=first,\
-              aecho=0.8:0.88:80:0.35,\
-              aecho=0.8:0.88:150:0.25,\
-              lowpass=f=1200,\
-              volume=0.25,\
-              afade=t=in:st=0:d=2,\
-              afade=t=out:st=${DURATION}:d=4[music]" \
-            -map "[music]" -t "$DURATION" \
-            /tmp/render/music.mp3 2>/dev/null && echo "✅ Music generated" || echo "⚠ Music generation failed"
-        env:
-          DURATIONS: ${{ inputs.scene_durations }}
+
+          # --- Freesound trending: pick top-rated music loop for mood, download preview mp3.
+          # Optional: requires FREESOUND_API_KEY (free). If missing / fails → synth fallback.
+          if [ -n "$FREESOUND_API_KEY" ]; then
+            python3 - <<'PYEOF' || true
+          import os, json, random, urllib.request, urllib.parse, urllib.error
+
+          music = os.environ.get('MUSIC_TYPE', 'cosmic_ambient')
+          QUERIES = {
+              'cosmic_ambient': ['ambient pad loop', 'cinematic pad ambient', 'space ambient loop', 'ethereal synth'],
+              'energetic':      ['edm beat loop', 'electronic upbeat', 'trap beat 120bpm', 'dance loop'],
+              'mystical':       ['mystical ambient loop', 'mystery tension loop', 'dark ambient cinematic'],
+              'upbeat':         ['happy pop loop', 'uplifting beat', 'feelgood instrumental loop'],
+          }
+          queries = QUERIES.get(music, QUERIES['cosmic_ambient'])
+          key = os.environ['FREESOUND_API_KEY']
+
+          def pick():
+              for q in random.sample(queries, len(queries)):
+                  url = 'https://freesound.org/apiv2/search/text/?' + urllib.parse.urlencode({
+                      'query': q,
+                      'filter': 'duration:[20 TO 120] type:wav OR type:mp3 OR type:ogg',
+                      'fields': 'id,name,previews,duration,avg_rating',
+                      'sort': 'rating_desc',
+                      'page_size': 15,
+                      'token': key,
+                  })
+                  try:
+                      data = json.loads(urllib.request.urlopen(url, timeout=15).read())
+                  except Exception as e:
+                      print(f'freesound search fail [{q}]: {e}'); continue
+                  results = data.get('results', [])
+                  random.shuffle(results)
+                  for r in results[:5]:
+                      prev = (r.get('previews') or {}).get('preview-hq-mp3') or (r.get('previews') or {}).get('preview-lq-mp3')
+                      if not prev: continue
+                      try:
+                          urllib.request.urlretrieve(prev, '/tmp/render/music_raw.mp3')
+                          print(f'✅ Freesound: "{r.get("name")}" ({q}, rating={r.get("avg_rating")})')
+                          return True
+                      except Exception as e:
+                          print(f'freesound dl fail: {e}')
+              return False
+
+          if pick():
+              # Loop + fade + normalize so it fills the full video.
+              import subprocess, sys
+              dur = float(os.environ.get('DURATION') or '30')
+              subprocess.run([
+                  'ffmpeg', '-y', '-stream_loop', '-1', '-i', '/tmp/render/music_raw.mp3',
+                  '-t', str(dur),
+                  '-af', f'loudnorm=I=-18:TP=-1.5,afade=t=in:st=0:d=1.5,afade=t=out:st={max(0,dur-3):.2f}:d=3',
+                  '-c:a', 'libmp3lame', '-q:a', '3',
+                  '/tmp/render/music.mp3',
+              ], check=True, capture_output=True)
+              print('✅ Background track ready from Freesound')
+          else:
+              sys.exit(2)  # no track — trigger synth fallback
+          PYEOF
+          fi
+
+          # --- Synth fallback (always runs if Freesound didn't produce /tmp/render/music.mp3).
+          if [ ! -s /tmp/render/music.mp3 ]; then
+            echo "↪ Synth music fallback"
+            export DURATION
+            ffmpeg -y \
+              -f lavfi -i "aevalsrc=0.14*sin(528*2*PI*t)+0.10*sin(1056*2*PI*t)+0.06*sin(396*2*PI*t):s=44100" \
+              -f lavfi -i "aevalsrc=0.10*sin(174*2*PI*t)+0.06*sin(285*2*PI*t):s=44100" \
+              -filter_complex "[0:a][1:a]amix=inputs=2:duration=first,aecho=0.8:0.88:80:0.35,aecho=0.8:0.88:150:0.25,lowpass=f=1200,volume=0.55,afade=t=in:st=0:d=2,afade=t=out:st=${DURATION}:d=4[music]" \
+              -map "[music]" -t "$DURATION" \
+              /tmp/render/music.mp3 2>/dev/null \
+              && echo "✅ Synth music generated" \
+              || echo "⚠ Music generation failed"
+          fi
+          ls -lh /tmp/render/music.mp3 2>/dev/null || true
 
       - name: Build video (Ken Burns + B-roll/Luma + xfade transitions)
         run: |
@@ -647,11 +712,12 @@ jobs:
           HAVE_MUSIC=$([ -f /tmp/render/music.mp3 ] && echo yes || echo no)
           echo "Voice: $HAVE_VOICE | Music: $HAVE_MUSIC"
 
-          # Sidechain-ducked mix:
-          #   [voice] splits into [voice_out] (played) + [voice_sc] (side-chain trigger).
-          #   [music] gets compressed by [voice_sc] → auto-quietens when voice plays.
-          #   Final music volume ×0.9 (was 0.18 → inaudible). Voice stays at 1.0.
-          DUCK_FILTER="[1:a]asplit=2[voice_out][voice_sc];[2:a][voice_sc]sidechaincompress=threshold=0.05:ratio=10:attack=15:release=300:makeup=1[mduck];[mduck]volume=0.9[m];[voice_out][m]amix=inputs=2:duration=first:dropout_transition=2,dynaudnorm=f=150:g=15[a]"
+          # Sidechain-ducked mix (LOUD music under voice, still audible during speech):
+          #   voice at volume=0.9, split — one copy plays, one drives sidechain.
+          #   music boosted to 1.4, compressed gently (ratio 4) under voice → drops to ~40%,
+          #   full 1.4 between words. amix normalize=0 so levels are additive, then a
+          #   soft acompressor limits the sum to prevent clipping.
+          DUCK_FILTER="[1:a]volume=0.9,asplit=2[voice_out][voice_sc];[2:a]volume=1.4[mloud];[mloud][voice_sc]sidechaincompress=threshold=0.08:ratio=4:attack=20:release=250:makeup=1.5[mduck];[voice_out][mduck]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[mix];[mix]acompressor=threshold=-1dB:ratio=2:attack=5:release=80[a]"
 
           if [ "$HAVE_VOICE" = "yes" ] && [ "$HAVE_MUSIC" = "yes" ]; then
             ffmpeg -y -i /tmp/render/video_final.mp4 \
@@ -713,18 +779,22 @@ jobs:
           OUTRO_FC="[0:v]scale=720:720,format=rgba,fade=in:st=0:d=0.3[q];[1:v][q]overlay=(W-w)/2:(H-h)/2-80:format=auto,drawtext=fontfile=/tmp/render/fonts/Inter-Bold.ttf:text='СКАНИРУЙ — ТВОЙ ТРЕК':fontcolor=white:fontsize=56:x=(w-text_w)/2:y=h*0.82:alpha='if(lt(t,0.3),t/0.3,1)',drawtext=fontfile=/tmp/render/fonts/Inter-Regular.ttf:text='yupsoul.ru':fontcolor=0xB794F6:fontsize=44:x=(w-text_w)/2:y=h*0.87:alpha='if(lt(t,0.3),t/0.3,1)',format=yuv420p[vout]"
           ffmpeg -y -loop 1 -t 1.8 -i /tmp/render/qr.png -f lavfi -t 1.8 -i "color=c=0x0A0A1A:s=1080x1920:r=30" -f lavfi -t 1.8 -i "anullsrc=channel_layout=stereo:sample_rate=44100" -filter_complex "$OUTRO_FC" -map "[vout]" -map 2:a -c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p -c:a aac -b:a 192k -shortest /tmp/render/outro.mp4
 
-          # --- Concat: intro + main + outro.
-          cat > /tmp/render/concat_final.txt <<EOF
-          file '/tmp/render/intro.mp4'
-          file '/tmp/render/output.mp4'
-          file '/tmp/render/outro.mp4'
-          EOF
-
-          ffmpeg -y -f concat -safe 0 -i /tmp/render/concat_final.txt \
+          # --- Concat with FILTER (not demuxer). Demuxer's copy mode broke on
+          # heterogeneous AAC streams (intro/outro's anullsrc vs main's real mix
+          # had different sample rates / packet timings → decoder errors).
+          # Filter concat re-encodes → reliable, ~30s extra cost.
+          ls -lh /tmp/render/intro.mp4 /tmp/render/output.mp4 /tmp/render/outro.mp4 || true
+          ffmpeg -y \
+            -i /tmp/render/intro.mp4 \
+            -i /tmp/render/output.mp4 \
+            -i /tmp/render/outro.mp4 \
+            -filter_complex "[0:v:0][0:a:0][1:v:0][1:a:0][2:v:0][2:a:0]concat=n=3:v=1:a=1[v][a]" \
+            -map "[v]" -map "[a]" \
             -c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p \
-            -c:a aac -b:a 192k /tmp/render/output_final.mp4 \
+            -c:a aac -b:a 192k -ar 44100 \
+            /tmp/render/output_final.mp4 \
             && echo "✅ Intro + main + outro concat" \
-            || (cp /tmp/render/output.mp4 /tmp/render/output_final.mp4 && echo "⚠ Concat failed, fallback to main only")
+            || (echo "⚠ Concat filter failed — keeping main only"; cp /tmp/render/output.mp4 /tmp/render/output_final.mp4)
 
           mv /tmp/render/output_final.mp4 /tmp/render/output.mp4
           ls -lh /tmp/render/output.mp4

@@ -6,7 +6,7 @@ import satori from 'satori';
 import { Resvg } from '@resvg/resvg-js';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { VideoScene, ZodiacSign } from '../types';
+import type { VideoScene, ZodiacSign, ContentRubric } from '../types';
 import { ZODIAC_RU, ZODIAC_EMOJI } from '../types';
 
 const W = 1080;
@@ -118,16 +118,133 @@ const BRAND_SITE_HOST = (process.env.BRAND_SITE_URL || 'https://yupsoul.ru')
   .replace(/^https?:\/\//, '')
   .replace(/\/$/, '');
 
+// --- Theme system ------------------------------------------------------
+// Each theme = 3 HSL stops + accent. Within one video we pick ONE theme
+// (by sign/rubric seed) and apply tiny per-scene hue drift (~±8°) so
+// slides feel cohesive. Across different videos the seed picks a
+// different theme, giving strong visual contrast between topics.
+type HSL = [number, number, number]; // hue, sat%, light%
+interface Theme {
+  a: HSL; // top-left gradient stop
+  b: HSL; // middle stop
+  c: HSL; // bottom-right stop
+  accents: string[]; // accent pool (per-scene rotation inside one theme)
+  angle: number; // gradient angle base
+}
+
+// Sign-family themes (fire / earth / air / water) + rubric themes.
+const THEMES: Record<string, Theme> = {
+  fire: {
+    a: [12, 65, 8], b: [18, 75, 20], c: [345, 70, 14],
+    accents: ['#F6AD55', '#FBD38D', '#F687B3', '#FC8181'],
+    angle: 155,
+  },
+  earth: {
+    a: [140, 25, 7], b: [45, 35, 18], c: [95, 30, 12],
+    accents: ['#D4A574', '#F6E05E', '#9AE6B4', '#B794A0'],
+    angle: 160,
+  },
+  air: {
+    a: [220, 50, 8], b: [195, 60, 22], c: [260, 45, 14],
+    accents: ['#90CDF4', '#B794F6', '#F7FAFC', '#38B2AC'],
+    angle: 150,
+  },
+  water: {
+    a: [250, 55, 6], b: [225, 65, 18], c: [280, 55, 12],
+    accents: ['#B794F6', '#90CDF4', '#F687B3', '#38B2AC'],
+    angle: 165,
+  },
+  cosmic: {
+    a: [245, 60, 6], b: [270, 70, 18], c: [230, 60, 10],
+    accents: ['#B794F6', '#D4A574', '#F687B3', '#38B2AC'],
+    angle: 160,
+  },
+  brand_sounds: {
+    a: [210, 12, 7], b: [200, 18, 18], c: [0, 0, 12],
+    accents: ['#E2E8F0', '#D4A574', '#9AE6B4', '#B794F6'],
+    angle: 145,
+  },
+  celebrities: {
+    a: [0, 0, 6], b: [40, 60, 18], c: [330, 35, 10],
+    accents: ['#F6D56B', '#FBD38D', '#F687B3', '#FC8181'],
+    angle: 150,
+  },
+  gift: {
+    a: [340, 50, 8], b: [15, 60, 20], c: [280, 45, 12],
+    accents: ['#F687B3', '#F6AD55', '#FBD38D', '#B794F6'],
+    angle: 155,
+  },
+  tutorial: {
+    a: [210, 40, 8], b: [190, 50, 18], c: [240, 40, 12],
+    accents: ['#90CDF4', '#38B2AC', '#B794F6', '#E2E8F0'],
+    angle: 160,
+  },
+};
+
+const SIGN_FAMILY: Record<ZodiacSign, 'fire' | 'earth' | 'air' | 'water'> = {
+  aries: 'fire', leo: 'fire', sagittarius: 'fire',
+  taurus: 'earth', virgo: 'earth', capricorn: 'earth',
+  gemini: 'air', libra: 'air', aquarius: 'air',
+  cancer: 'water', scorpio: 'water', pisces: 'water',
+};
+
+function hashStr(s: string): number {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
+function pickTheme(rubric?: ContentRubric, sign?: ZodiacSign, seed?: string): Theme {
+  // Rubric-specific themes win over sign family (except zodiac-centric rubrics).
+  const signCentric: ContentRubric[] = [
+    'zodiac_sound', 'compatibility', 'zodiac_memes', 'zodiac_battle',
+    'signs_as_genres', 'daily_energy', 'astro_facts',
+  ];
+  if (rubric === 'brand_sounds') return THEMES.brand_sounds;
+  if (rubric === 'celebrities') return THEMES.celebrities;
+  if (rubric === 'gift') return THEMES.gift;
+  if (rubric === 'tutorial' || rubric === 'backstage_ai') return THEMES.tutorial;
+  if (sign && (!rubric || signCentric.includes(rubric))) {
+    return THEMES[SIGN_FAMILY[sign]];
+  }
+  // Fallback: pick one of the four families by seed so unrelated jobs diverge.
+  const pool = ['fire', 'earth', 'air', 'water', 'cosmic'];
+  const pick = pool[(seed ? hashStr(seed) : 0) % pool.length];
+  return THEMES[pick];
+}
+
+function hsl([h, s, l]: HSL, hueShift = 0, satShift = 0, lightShift = 0): string {
+  const hh = ((h + hueShift) % 360 + 360) % 360;
+  const ss = Math.max(0, Math.min(100, s + satShift));
+  const ll = Math.max(0, Math.min(100, l + lightShift));
+  return `hsl(${hh.toFixed(1)}, ${ss.toFixed(1)}%, ${ll.toFixed(1)}%)`;
+}
+
+function buildBackground(theme: Theme, sceneIndex: number, seed: number): string {
+  // Small per-scene drift so slides inside one video feel cohesive but not identical.
+  // Hue wobbles ±8°, lightness ±2%, gradient angle ±6°.
+  const hueDrift = ((sceneIndex * 7 + seed) % 17) - 8;
+  const lightDrift = ((sceneIndex * 3 + seed) % 5) - 2;
+  const angleDrift = ((sceneIndex * 5 + seed) % 13) - 6;
+  const angle = theme.angle + angleDrift;
+  const a = hsl(theme.a, hueDrift, 0, lightDrift);
+  const b = hsl(theme.b, hueDrift, 0, lightDrift);
+  const c = hsl(theme.c, hueDrift, 0, lightDrift);
+  return `linear-gradient(${angle}deg, ${a} 0%, ${b} 50%, ${c} 100%)`;
+}
+
 export interface RenderSlideOptions {
   scene: VideoScene;
   sceneIndex: number;
   totalScenes: number;
   zodiacSign?: ZodiacSign;
   zodiacSign2?: ZodiacSign;
+  rubric?: ContentRubric;
+  themeSeed?: string; // jobId or title — keeps one video cohesive
 }
 
 export async function renderSlide(opts: RenderSlideOptions): Promise<Buffer> {
-  const { scene, sceneIndex, zodiacSign, zodiacSign2 } = opts;
+  const { scene, sceneIndex, zodiacSign, zodiacSign2, rubric, themeSeed } = opts;
   const fonts = loadFonts();
 
   const isHook = scene.isHook || sceneIndex === 0;
@@ -135,20 +252,15 @@ export async function renderSlide(opts: RenderSlideOptions): Promise<Buffer> {
 
   const headingSize = headingFontSize(scene.heading, isHook);
 
-  // Background gradient variant per scene
-  const bgGradients = [
-    `linear-gradient(160deg, #0A0A1A 0%, #2D1B69 50%, #0A0A1A 100%)`,
-    `linear-gradient(140deg, #0A0A1A 0%, #1A1040 40%, #3D1050 100%)`,
-    `linear-gradient(170deg, #050510 0%, #1B1050 50%, #2D0830 100%)`,
-    `linear-gradient(150deg, #080818 0%, #1A2060 50%, #080818 100%)`,
-    `linear-gradient(160deg, #0A0A1A 0%, #2A1060 40%, #1A0840 100%)`,
-    `linear-gradient(140deg, #050510 0%, #201060 50%, #050510 100%)`,
-  ];
-  const bg = bgGradients[sceneIndex % bgGradients.length];
+  // Seed derived from job identity — keeps one video cohesive, different
+  // jobs diverge.
+  const seedStr = `${themeSeed || ''}|${rubric || ''}|${zodiacSign || ''}|${zodiacSign2 || ''}`;
+  const seed = hashStr(seedStr) % 997;
+  const theme = pickTheme(rubric, zodiacSign, seedStr);
+  const bg = buildBackground(theme, sceneIndex, seed);
 
-  // Accent color per scene
-  const accents = [COLORS.neonLavender, COLORS.softGold, COLORS.cosmicPink, COLORS.tealGlow];
-  const accent = scene.accentColor || accents[sceneIndex % accents.length];
+  // Accent rotates within the theme's own pool (not global rainbow).
+  const accent = scene.accentColor || theme.accents[(sceneIndex + seed) % theme.accents.length];
 
   // Sign display
   const signText = zodiacSign ? `${ZODIAC_EMOJI[zodiacSign]} ${ZODIAC_RU[zodiacSign]}` : '';
@@ -435,7 +547,9 @@ export async function renderSlide(opts: RenderSlideOptions): Promise<Buffer> {
 export async function renderAllSlides(
   scenes: VideoScene[],
   zodiacSign?: ZodiacSign,
-  zodiacSign2?: ZodiacSign
+  zodiacSign2?: ZodiacSign,
+  rubric?: ContentRubric,
+  themeSeed?: string,
 ): Promise<Buffer[]> {
   const buffers: Buffer[] = [];
   for (let i = 0; i < scenes.length; i++) {
@@ -445,6 +559,8 @@ export async function renderAllSlides(
       totalScenes: scenes.length,
       zodiacSign,
       zodiacSign2,
+      rubric,
+      themeSeed,
     });
     buffers.push(buf);
   }

@@ -570,21 +570,30 @@ jobs:
           IN=/tmp/render/video_stitched.mp4
           OUT=/tmp/render/video_final.mp4
 
-          # Waveform style:
-          #  - 240px tall, p2p mode (smoother than cline)
-          #  - sqrt amplitude scale (tiny syllables stay visible)
-          #  - gblur for soft, solid line look (no sharp edges)
-          #  - purple→gold gradient, ~1s window per frame (rate=25)
-          #  - amix of voice boosted 3× before viz → "zoom in" feel
-          WAVE_FILTER="[1:a]volume=3,showwaves=s=1080x240:mode=p2p:rate=25:scale=sqrt:colors=0xB794F6|0xF6D56B,format=rgba,colorkey=0x000000:0.02:0,gblur=sigma=1.8[wave]"
-          # overlay at y=H-470 → waveform vertical center ≈ H-350 (same zone as subs)
-          WAVE_OVERLAY="[0:v][wave]overlay=0:H-470:format=auto[vw]"
+          # Waveform style — "guitar string" look:
+          #  - lowpass=f=120 kills high-freq detail → only slow, macro oscillations remain
+          #    (2–3 gentle bends per frame instead of dozens of tiny spikes)
+          #  - mode=cline draws one connected smooth line through those samples
+          #  - rate=30 = 33ms audio per frame → at ~120Hz cutoff that's ~3–4 cycles visible
+          #  - gblur sigma=2.4 thickens the line into a soft glowing stroke
+          #  - Baseline: a thin static line that's always visible (taut string when
+          #    silent); when voice kicks in, the waveform on top starts oscillating
+          #    around it — reads as a recording visualizer
+          BASELINE="color=c=0xB794F660:size=1080x3:rate=30,format=rgba[baseline]"
+          WAVE_FILTER="[1:a]volume=4,lowpass=f=120,showwaves=s=1080x180:mode=cline:rate=30:scale=lin:colors=0xB794F6,format=rgba,colorkey=0x000000:0.04:0.15,gblur=sigma=2.4[wave]"
+          # Place baseline through the wave's vertical centre, then overlay the wave on top.
+          # Wave is 180px tall, anchored at y=H-470; centre = H-380 → baseline row = H-380.
+          # shortest=1 on baseline stops the infinite color source when main video ends.
+          # eof_action=pass on wave lets the main video continue after voice audio EOF
+          # (otherwise overlay would freeze the last wave frame onto silent tail).
+          BASELINE_OVERLAY="[0:v][baseline]overlay=0:H-380:shortest=1:format=auto[vbase]"
+          WAVE_OVERLAY="[vbase][wave]overlay=0:H-470:eof_action=pass:format=auto[vw]"
           SUBS_FILTER="[vw]subtitles=/tmp/render/karaoke.ass:fontsdir=/tmp/render/fonts[vout]"
 
           if [ "$HAVE_SUBS" = "yes" ] && [ "$HAVE_VOICE" = "yes" ]; then
-            # Order matters: waveform first, subtitles burned ON TOP so text is readable.
+            # Order matters: baseline+waveform first, subtitles burned ON TOP so text is readable.
             ffmpeg -y -i "$IN" -i /tmp/render/voiceover.mp3 \
-              -filter_complex "${WAVE_FILTER};${WAVE_OVERLAY};${SUBS_FILTER}" \
+              -filter_complex "${BASELINE};${WAVE_FILTER};${BASELINE_OVERLAY};${WAVE_OVERLAY};${SUBS_FILTER}" \
               -map "[vout]" -c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p -an \
               "$OUT" && echo "✅ Waveform + karaoke (subs on top)"
           elif [ "$HAVE_SUBS" = "yes" ]; then
@@ -594,7 +603,7 @@ jobs:
               "$OUT" && echo "✅ Karaoke only"
           elif [ "$HAVE_VOICE" = "yes" ]; then
             ffmpeg -y -i "$IN" -i /tmp/render/voiceover.mp3 \
-              -filter_complex "${WAVE_FILTER};${WAVE_OVERLAY};[vw]null[vout]" \
+              -filter_complex "${BASELINE};${WAVE_FILTER};${BASELINE_OVERLAY};${WAVE_OVERLAY};[vw]null[vout]" \
               -map "[vout]" -c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p -an \
               "$OUT" && echo "✅ Waveform only"
           else

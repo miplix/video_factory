@@ -63,7 +63,13 @@ export async function POST(req: NextRequest) {
     // 2. Render slides
     job.status = 'rendering_slides';
     await saveJob(config, job);
-    const slideBuffers = await renderAllSlides(script.scenes, script.zodiacSign, script.zodiacSign2);
+    const slideBuffers = await renderAllSlides(
+      script.scenes,
+      script.zodiacSign,
+      script.zodiacSign2,
+      script.rubric,
+      jobId,
+    );
 
     // 3. Upload slides to R2
     job.status = 'uploading';

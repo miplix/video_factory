@@ -717,7 +717,7 @@ jobs:
           #   music boosted to 1.4, compressed gently (ratio 4) under voice → drops to ~40%,
           #   full 1.4 between words. amix normalize=0 so levels are additive, then a
           #   soft acompressor limits the sum to prevent clipping.
-          DUCK_FILTER="[1:a]volume=0.9,asplit=2[voice_out][voice_sc];[2:a]volume=1.4[mloud];[mloud][voice_sc]sidechaincompress=threshold=0.08:ratio=4:attack=20:release=250:makeup=1.5[mduck];[voice_out][mduck]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[mix];[mix]acompressor=threshold=-1dB:ratio=2:attack=5:release=80[a]"
+          DUCK_FILTER="[1:a]volume=0.95,asplit=2[voice_out][voice_sc];[2:a]volume=0.85[mloud];[mloud][voice_sc]sidechaincompress=threshold=0.05:ratio=8:attack=15:release=350:makeup=1[mduck];[voice_out][mduck]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[mix];[mix]acompressor=threshold=-1dB:ratio=2:attack=5:release=80[a]"
 
           if [ "$HAVE_VOICE" = "yes" ] && [ "$HAVE_MUSIC" = "yes" ]; then
             ffmpeg -y -i /tmp/render/video_final.mp4 \

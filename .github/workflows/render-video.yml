@@ -53,7 +53,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg fonts-liberation fonts-dejavu fonts-noto-color-emoji
           ffmpeg -version | head -1
-          pip3 install -q boto3 edge-tts requests faster-whisper
+          pip3 install -q boto3 edge-tts requests faster-whisper 'qrcode[pil]' Pillow
           echo "✅ Dependencies installed"
 
       - name: Create workspace
@@ -80,9 +80,10 @@ jobs:
         env:
           VOICE_TEXT: ${{ inputs.voiceover_text }}
           TTS_VOICE: ${{ secrets.TTS_VOICE }}
+          DURATIONS: ${{ inputs.scene_durations }}
         run: |
           python3 - <<'PYEOF'
-          import os, re, asyncio, edge_tts
+          import os, re, json, asyncio, subprocess, edge_tts
 
           text = os.environ.get('VOICE_TEXT', '').strip()
           if not text:
@@ -107,8 +108,36 @@ jobs:
               c = edge_tts.Communicate(text, voice=voice, rate='+0%', volume='+0%')
               await c.save('/tmp/render/voiceover.mp3')
               print("✅ Voiceover generated")
-
           asyncio.run(run())
+
+          # --- Adaptive speed-up: if voice is longer than the video budget,
+          # nudge speed up to 1.15× max (atempo) so last scene doesn't have to
+          # balloon. Anything over 1.15× sounds chipmunky, so we cap there and
+          # let the downstream video-build extend the last scene for the rest.
+          try:
+              durations = json.loads(os.environ.get('DURATIONS', '[]') or '[]')
+          except Exception:
+              durations = []
+          if durations:
+              xfade_shrink = max(0, (len(durations) - 1) * 0.5)
+              budget = sum(durations) - xfade_shrink - 1.5  # leave 1.5s tail
+              out = subprocess.check_output([
+                  'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                  '-of', 'default=noprint_wrappers=1:nokey=1', '/tmp/render/voiceover.mp3',
+              ], text=True).strip()
+              vlen = float(out)
+              print(f"Voice={vlen:.2f}s, video budget={budget:.2f}s")
+              if budget > 2 and vlen > budget + 0.3:
+                  factor = min(1.15, vlen / budget)
+                  if factor > 1.02:
+                      subprocess.run([
+                          'ffmpeg', '-y', '-i', '/tmp/render/voiceover.mp3',
+                          '-filter:a', f'atempo={factor:.3f}',
+                          '-c:a', 'libmp3lame', '-q:a', '3',
+                          '/tmp/render/voiceover_sped.mp3',
+                      ], check=True, capture_output=True)
+                      os.replace('/tmp/render/voiceover_sped.mp3', '/tmp/render/voiceover.mp3')
+                      print(f"⚡ Voice sped up ×{factor:.3f} ({vlen:.2f}s → {vlen/factor:.2f}s)")
           PYEOF
 
       - name: Generate karaoke subtitles (Whisper word-timestamps)
@@ -612,25 +641,31 @@ jobs:
           fi
           ls -lh "$OUT"
 
-      - name: Mix audio (voiceover + background music)
+      - name: Mix audio (voiceover + ducked music)
         run: |
           HAVE_VOICE=$([ -f /tmp/render/voiceover.mp3 ] && echo yes || echo no)
           HAVE_MUSIC=$([ -f /tmp/render/music.mp3 ] && echo yes || echo no)
           echo "Voice: $HAVE_VOICE | Music: $HAVE_MUSIC"
 
+          # Sidechain-ducked mix:
+          #   [voice] splits into [voice_out] (played) + [voice_sc] (side-chain trigger).
+          #   [music] gets compressed by [voice_sc] → auto-quietens when voice plays.
+          #   Final music volume ×0.9 (was 0.18 → inaudible). Voice stays at 1.0.
+          DUCK_FILTER="[1:a]asplit=2[voice_out][voice_sc];[2:a][voice_sc]sidechaincompress=threshold=0.05:ratio=10:attack=15:release=300:makeup=1[mduck];[mduck]volume=0.9[m];[voice_out][m]amix=inputs=2:duration=first:dropout_transition=2,dynaudnorm=f=150:g=15[a]"
+
           if [ "$HAVE_VOICE" = "yes" ] && [ "$HAVE_MUSIC" = "yes" ]; then
             ffmpeg -y -i /tmp/render/video_final.mp4 \
               -i /tmp/render/voiceover.mp3 -i /tmp/render/music.mp3 \
-              -filter_complex "[1:a]volume=1.0[v];[2:a]volume=0.18[m];[v][m]amix=inputs=2:duration=first:dropout_transition=2[a]" \
+              -filter_complex "$DUCK_FILTER" \
               -map "0:v" -map "[a]" -c:v copy -c:a aac -b:a 192k -shortest \
-              /tmp/render/output.mp4 && echo "✅ Mixed voice + music"
+              /tmp/render/output.mp4 && echo "✅ Mixed voice + ducked music"
           elif [ "$HAVE_VOICE" = "yes" ]; then
             ffmpeg -y -i /tmp/render/video_final.mp4 -i /tmp/render/voiceover.mp3 \
               -c:v copy -c:a aac -b:a 192k -shortest /tmp/render/output.mp4 \
               && echo "✅ Mixed voice only"
           elif [ "$HAVE_MUSIC" = "yes" ]; then
             ffmpeg -y -i /tmp/render/video_final.mp4 -i /tmp/render/music.mp3 \
-              -filter_complex "[1:a]volume=0.4[a]" -map "0:v" -map "[a]" \
+              -filter_complex "[1:a]volume=0.7[a]" -map "0:v" -map "[a]" \
               -c:v copy -c:a aac -b:a 192k -shortest /tmp/render/output.mp4 \
               && echo "✅ Mixed music only"
           else
@@ -638,6 +673,69 @@ jobs:
             echo "⚠ No audio"
           fi
           ls -lh /tmp/render/output.mp4
+
+      - name: Build intro logo + outro QR, concat
+        run: |
+          LOGO=src/lib/assets/intro-logo.png
+          if [ ! -f "$LOGO" ]; then
+            echo "No intro logo found — skipping intro/outro"
+            cp /tmp/render/output.mp4 /tmp/render/output_final.mp4
+            exit 0
+          fi
+
+          # Generate QR pointing at user's real ref link.
+          python3 - <<'PYEOF'
+          import qrcode
+          from qrcode.constants import ERROR_CORRECT_H
+          from PIL import Image
+          url = 'https://t.me/Yup_Soul_bot?start=ref_TUAM'
+          qr = qrcode.QRCode(version=None, error_correction=ERROR_CORRECT_H, box_size=18, border=2)
+          qr.add_data(url); qr.make(fit=True)
+          img = qr.make_image(fill_color='#0A0A1A', back_color='#F7FAFC').convert('RGB')
+          # paste small logo in center for branded look
+          try:
+              logo = Image.open('src/lib/assets/intro-logo.png').convert('RGBA')
+              W, H = img.size
+              lsize = int(W * 0.22)
+              logo = logo.resize((lsize, lsize), Image.LANCZOS)
+              img.paste(logo, ((W-lsize)//2, (H-lsize)//2), logo)
+          except Exception as e:
+              print(f'logo paste skip: {e}')
+          img.save('/tmp/render/qr.png')
+          print('✅ QR generated')
+          PYEOF
+
+          # --- Intro: 0.8s logo on dark bg with fade-in + subtle zoom-in, silent.
+          INTRO_FC="[0:v]scale=760:760,format=rgba,fade=in:st=0:d=0.25,fade=out:st=0.65:d=0.15[lg];[1:v][lg]overlay=(W-w)/2:(H-h)/2:format=auto,zoompan=z='min(zoom+0.0015,1.05)':d=24:s=1080x1920:fps=30[vout]"
+          ffmpeg -y -loop 1 -t 0.8 -i "$LOGO" -f lavfi -t 0.8 -i "color=c=0x0A0A1A:s=1080x1920:r=30" -f lavfi -t 0.8 -i "anullsrc=channel_layout=stereo:sample_rate=44100" -filter_complex "$INTRO_FC" -map "[vout]" -map 2:a -c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p -c:a aac -b:a 192k -shortest /tmp/render/intro.mp4
+
+          # --- Outro: 1.8s dark bg + QR + "сканируй" CTA, silent.
+          OUTRO_FC="[0:v]scale=720:720,format=rgba,fade=in:st=0:d=0.3[q];[1:v][q]overlay=(W-w)/2:(H-h)/2-80:format=auto,drawtext=fontfile=/tmp/render/fonts/Inter-Bold.ttf:text='СКАНИРУЙ — ТВОЙ ТРЕК':fontcolor=white:fontsize=56:x=(w-text_w)/2:y=h*0.82:alpha='if(lt(t,0.3),t/0.3,1)',drawtext=fontfile=/tmp/render/fonts/Inter-Regular.ttf:text='yupsoul.ru':fontcolor=0xB794F6:fontsize=44:x=(w-text_w)/2:y=h*0.87:alpha='if(lt(t,0.3),t/0.3,1)',format=yuv420p[vout]"
+          ffmpeg -y -loop 1 -t 1.8 -i /tmp/render/qr.png -f lavfi -t 1.8 -i "color=c=0x0A0A1A:s=1080x1920:r=30" -f lavfi -t 1.8 -i "anullsrc=channel_layout=stereo:sample_rate=44100" -filter_complex "$OUTRO_FC" -map "[vout]" -map 2:a -c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p -c:a aac -b:a 192k -shortest /tmp/render/outro.mp4
+
+          # --- Concat: intro + main + outro.
+          cat > /tmp/render/concat_final.txt <<EOF
+          file '/tmp/render/intro.mp4'
+          file '/tmp/render/output.mp4'
+          file '/tmp/render/outro.mp4'
+          EOF
+
+          ffmpeg -y -f concat -safe 0 -i /tmp/render/concat_final.txt \
+            -c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p \
+            -c:a aac -b:a 192k /tmp/render/output_final.mp4 \
+            && echo "✅ Intro + main + outro concat" \
+            || (cp /tmp/render/output.mp4 /tmp/render/output_final.mp4 && echo "⚠ Concat failed, fallback to main only")
+
+          mv /tmp/render/output_final.mp4 /tmp/render/output.mp4
+          ls -lh /tmp/render/output.mp4
+
+      - name: Extract Telegram thumbnail
+        run: |
+          # Frame 2 of the main video → JPG ≤200KB for Telegram 'thumb' param.
+          ffmpeg -y -ss 1.2 -i /tmp/render/output.mp4 -frames:v 1 \
+            -vf "scale=320:-1" -q:v 5 /tmp/render/thumb.jpg 2>/dev/null \
+            || echo "⚠ Thumbnail extraction failed (non-fatal)"
+          ls -lh /tmp/render/thumb.jpg 2>/dev/null || true
 
       - name: Upload to Cloudflare R2
         run: |
@@ -706,11 +804,14 @@ jobs:
           CAPTION="${{ inputs.caption }}"
           [ -z "$CAPTION" ] && CAPTION="🎬 Новое видео готово! #юпсол #астрология #yupsoul"
 
+          THUMB_ARG=""
+          [ -f /tmp/render/thumb.jpg ] && THUMB_ARG='-F thumbnail=@/tmp/render/thumb.jpg'
           RESULT=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendVideo" \
             -F "chat_id=${CHAT_ID}" \
             -F "video=@/tmp/render/output.mp4" \
             -F "caption=${CAPTION}" \
-            -F "supports_streaming=true" -F "width=1080" -F "height=1920")
+            -F "supports_streaming=true" -F "width=1080" -F "height=1920" \
+            $THUMB_ARG)
 
           OK=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))" 2>/dev/null)
           if [ "$OK" = "True" ]; then

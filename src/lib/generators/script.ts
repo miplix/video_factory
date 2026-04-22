@@ -13,6 +13,84 @@ import { pickBrands } from '../data/brands';
 const CHARS_PER_SEC = 14;
 const TAIL_BUFFER_SEC = 1.2;
 
+// --- Viral hook templates -------------------------------------------------
+// Rotated per generation; picked randomly (weighted) so every video opens
+// differently. Mapped from patterns that actually moved metrics on RU TikTok
+// in 2025–2026 (curiosity gap, pattern interrupt, identity call, POV, lists,
+// "guess the X", shock-numbers).
+type HookStyle =
+  | 'guess_sign'       // describe traits of the sign; reveal ONLY at end (NO sign/emoji/dates allowed until reveal)
+  | 'pattern_interrupt'// "СТОП. Если ты [знак] — смотри до конца"
+  | 'reveal'           // "99% [знаков] НЕ знают свой истинный звук"
+  | 'pov'              // "POV: ты [знак] и слышишь это впервые"
+  | 'numbered'         // "3 знака которые ломают AI"
+  | 'warning'          // "Не включай если ты [знак]"
+  | 'shock_number'     // "528 Гц — это ТВОЙ знак"
+  | 'vs'               // "[Знак1] vs [Знак2] — чей трек громче"
+  | 'secret';          // "Скрытая нота [знака], которую слышишь только ты"
+
+const HOOK_HINTS: Record<HookStyle, string> = {
+  guess_sign:
+    'Формат ЗАГАДКА: СЦЕНЫ 1–5 описывают поведение / музыкальные привычки / вайб знака БЕЗ ЛЮБЫХ подсказок. ' +
+    'ЗАПРЕЩЕНО в сценах 1–5: название знака, эмодзи знака, даты, слова «зодиак/созвездие/знак», имена стихий (огонь/вода/земля/воздух). ' +
+    'Только нейтральные черты и метафоры. Сцена 6 (CTA) — РАСКРЫТИЕ: «Это — [знак]. А твой звучит как?». Хук сцены 1: «Угадай знак по звуку».',
+  pattern_interrupt:
+    'Хук = pattern interrupt. Шаблон: «СТОП. Если ты [знак] — не пролистывай.» Сразу за ним — неожиданный факт, ломающий стереотип.',
+  reveal:
+    'Хук = разоблачение. Шаблон: «99% [знаков] НЕ знают, как звучит их душа». Дальше раскрываешь ПОЧЕМУ.',
+  pov:
+    'Хук = POV. Шаблон: «POV: ты [знак] и впервые слышишь СВОЙ AI-трек. Вот что происходит...». Далее сцены — реакция.',
+  numbered:
+    'Хук = список с числом в первом слове. Шаблон: «3 знака, которые ломают все AI-алгоритмы». Раскрываешь по одному в сценах 2–4.',
+  warning:
+    'Хук = предупреждение. Шаблон: «Не включай если ты [знак] — затянет на час». Дальше раскрываешь звук, от которого не оторваться.',
+  shock_number:
+    'Хук = шок-число. Шаблон: «528 Гц — это частота [знака]. Проверь на себе.». Объясняешь что это за частота и что чувствует слушатель.',
+  vs:
+    'Хук = батл. Шаблон: «[Знак1] против [Знак2]. Чей трек громче?». Серия раундов: энергия / ритм / настроение / финал.',
+  secret:
+    'Хук = секрет. Шаблон: «Скрытая нота [знака], которую слышишь только ТЫ». Объясняешь уникальность и зовёшь проверить.',
+};
+
+// Rubrics where "guess the sign" format actually makes sense (need a sign context).
+const GUESS_OK_RUBRICS = new Set(['zodiac_sound', 'zodiac_memes', 'astro_facts', 'daily_energy']);
+
+function pickHookStyle(rubric: ContentRubric, hasSign: boolean, hasTwoSigns: boolean): HookStyle {
+  if (rubric === 'compatibility' || rubric === 'zodiac_battle' || hasTwoSigns) return 'vs';
+  if (rubric === 'brand_sounds' || rubric === 'signs_as_genres') return 'numbered';
+  if (rubric === 'tutorial' || rubric === 'backstage_ai') return 'reveal';
+  if (rubric === 'gift') return 'pov';
+  if (rubric === 'celebrities') return Math.random() < 0.5 ? 'reveal' : 'secret';
+
+  // Sign-centric rubrics: rotate across the shock styles, with ~30% chance of guess_sign.
+  if (hasSign && GUESS_OK_RUBRICS.has(rubric)) {
+    const r = Math.random();
+    if (r < 0.3) return 'guess_sign';
+    const pool: HookStyle[] = ['pattern_interrupt', 'reveal', 'pov', 'warning', 'shock_number', 'secret'];
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+  const fallback: HookStyle[] = ['pattern_interrupt', 'reveal', 'numbered', 'secret'];
+  return fallback[Math.floor(Math.random() * fallback.length)];
+}
+
+// --- CTA bank — proven TikTok RU closers ----------------------------------
+// Prompt will pick one randomly; voiceover MUST avoid "бот" and @mentions
+// (TTS pronounces them poorly), so these are TTS-safe.
+const CTA_BANK = [
+  'Переходи по ссылке — свой трек за минуту',
+  'Создай свой звук — ссылка в шапке',
+  'Залетай сейчас — первый трек бесплатно',
+  'Жми ссылку в описании — твоя мелодия ждёт',
+  'Твой персональный трек — по ссылке',
+  'Включай свой звук — ссылка ниже',
+  'Получи свой трек — ссылка в профиле',
+  'Только сегодня — твой трек по ссылке',
+];
+
+function pickCTA(): string {
+  return CTA_BANK[Math.floor(Math.random() * CTA_BANK.length)];
+}
+
 function estimateVoiceSeconds(text: string): number {
   const clean = text.trim();
   if (!clean) return 0;
@@ -160,6 +238,10 @@ function buildPrompt(opts: ScriptGenOptions): string {
   const sign2Em = opts.zodiacSign2 ? ZODIAC_EMOJI[opts.zodiacSign2] : '';
   const rubricName = RUBRIC_RU[opts.rubric];
 
+  const hookStyle = pickHookStyle(opts.rubric, !!opts.zodiacSign, !!opts.zodiacSign2);
+  const hookTemplate = HOOK_HINTS[hookStyle];
+  const ctaSeed = pickCTA();
+
   let topicDesc = '';
   let hookHint = '';
   switch (opts.rubric) {
@@ -233,48 +315,66 @@ ${list}
   const sign1Text = sign1Ru ? `${sign1Ru} ${sign1Em}` : '';
   const sign2Text = sign2Ru ? `${sign2Ru} ${sign2Em}` : '';
 
+  // Guess-sign mode requires masking the sign name in the topic description
+  // and the hook hint, so LLM has no reason to leak it before the reveal.
+  const isGuess = hookStyle === 'guess_sign';
+  const maskedTopic = isGuess
+    ? `Опиши человека (поведение, привычки, вайб, что слушает, как ведёт себя в быту) БЕЗ упоминания знака зодиака. ` +
+      `Сцены 1–5 — чистые описания без подсказок. Сцена 6 (CTA) — раскрытие: «Это — ${sign1Ru}. А твой звучит как?».`
+    : topicDesc;
+
   return `Напиши сценарий вертикального TikTok-видео (30-35 секунд).
 
 Рубрика: ${rubricName}
-${sign1Text ? `Знак: ${sign1Text} (${sign1Dates})` : ''}
+${sign1Text && !isGuess ? `Знак: ${sign1Text} (${sign1Dates})` : ''}
+${sign1Text && isGuess ? `Знак (скрытый, раскрыть ТОЛЬКО в финальной сцене): ${sign1Text}` : ''}
 ${sign2Text ? `Второй знак: ${sign2Text}` : ''}
 
 ЗАДАЧА:
-${topicDesc}
+${maskedTopic}
 
-${hookHint ? `Направление хука: ${hookHint}` : ''}
+ВИРУСНЫЙ ХУК (обязательный шаблон сцены 1):
+${hookTemplate}
+${hookHint && !isGuess ? `Доп. направление: ${hookHint}` : ''}
+
+ПЕРВЫЕ 3 СЕКУНДЫ — ШОК:
+— Сцена 1 должна УДАРИТЬ. Провокация / вызов / секрет / число / POV.
+— НЕЛЬЗЯ: мягкое вступление, «привет, сегодня расскажу», описательный зачин.
+— МОЖНО: резкая фраза, неожиданное число, прямое обращение к зрителю, вопрос-разрыв шаблона.
 
 ЖЁСТКИЕ ТРЕБОВАНИЯ:
 
 1. СЦЕНЫ (6 штук, по 4-6 секунд):
-   — Сцена 1 (4с, isHook: true): КРЮЧОК. Провокация / вопрос / парадокс. Должна заставить НЕ листать.
+   — Сцена 1 (4с, isHook: true): КРЮЧОК по шаблону выше. Без «добро пожаловать», без мягких заходов.
    — Сцены 2-5: раскрытие темы, с градацией интереса. Payoff (главный инсайт) — в сцене 3 или 4.
-   — Последняя сцена (5с, isCTA: true): CTA. В voiceover НЕ употребляй слова «бот» и @mentions (TTS путается). Используй формат: «Создай свою мелодию в юпсол» или «Твой трек ждёт тебя в юпсол».
+   — Последняя сцена (5с, isCTA: true): CTA. В voiceover НЕ употребляй слова «бот» и @mentions (TTS путается).
+     Возьми за основу: «${ctaSeed}». Можешь слегка перефразировать, но сохрани смысл и длину (до 72 симв).
 
 2. heading (то, что видно на слайде, КРУПНО):
    — 2-6 слов максимум.
    — Без кавычек, без эмодзи.
    — Каждый heading самодостаточен (человек поймёт даже без звука).
+   ${isGuess ? '— В heading сцен 1–5 НЕЛЬЗЯ писать название знака, эмодзи знака, даты, стихию. Только нейтральные слова.' : ''}
 
 3. body (мелкий подзаголовок, опционально):
    — 0-8 слов. Уточнение / deadpan-комментарий. Может отсутствовать.
+   ${isGuess ? '— В body сцен 1–5 ТАКЖЕ запрещены знак/эмодзи/даты/стихия.' : ''}
 
 4. voiceover (озвучка, КРИТИЧНО по длине):
    — Сцена 4с: до 55 символов. Сцена 5с: до 72 символов. Сцена 6с: до 88 символов.
    — Живой разговорный русский. Никакого «дорогой зритель», никакого официоза.
    — Текст ЧИТАЕТСЯ как от лица друга, а не диктора.
    — ОБЯЗАТЕЛЬНО уложиться в лимит символов — иначе голос оборвётся на середине фразы.
+   ${isGuess ? '— В voiceover сцен 1–5 ТАКЖЕ запрещены знак/эмодзи/даты/стихия/созвездие.' : ''}
 
-5. CAPTION (подпись TikTok):
-   — До 140 символов.
-   — Формула: хук + интрига + лёгкий CTA.
-   — В конце — 1-2 эмодзи.
-   — Пример: «${sign1Ru || 'Твой знак'} звучит громче, чем ты думаешь 🎧 Проверь в боте»
+5. CAPTION (подпись TikTok — КОРОТКАЯ!):
+   — МАКСИМУМ 80 символов. Это жёсткое ограничение — TikTok обрезает длинное под кнопкой «ещё».
+   — Формула: один хлёсткий крючок + 1 эмодзи в конце. Без CTA — CTA уже в видео.
+   — Пример: «${isGuess ? 'Угадал знак? 🎧' : sign1Ru ? `${sign1Ru} звучит громче всех 🔥` : 'Твой звук ждёт 🎧'}»
 
-6. HASHTAGS (под капотом трендового анализа):
-   — 8-12 штук.
-   — Смесь: 2-3 широких (#рек #fyp #viral), 3-4 нишевых (#астрология #гороскоп #знакизодиака), 2-3 точечных (#${sign1Ru ? sign1Ru.toLowerCase() : 'зодиак'} #музыка #персональнаямелодия), 1-2 брендовых (#yupsoul #aiмузыка).
-   — Без «#хэштег1», только реальные трендовые.
+6. HASHTAGS (строго 5 штук — качество важнее количества):
+   — 5 тегов: 1 широкий (#рек или #fyp), 2 нишевых (#астрология #гороскоп), 1 точечный (#${sign1Ru ? sign1Ru.toLowerCase() : 'зодиак'} или #музыка), 1 брендовый (#yupsoul).
+   — Без пробелов внутри тега. Только реальные трендовые.
 
 7. MUSIC: выбери один тип из: cosmic_ambient | energetic | mystical | upbeat — в зависимости от настроения сценария.
 
@@ -335,14 +435,28 @@ function parseScript(raw: string, opts: ScriptGenOptions): VideoScript {
 
   const totalDuration = scenes.reduce((s, sc) => s + sc.duration, 0);
 
+  // Caption hard-limit: TikTok truncates past ~80 chars under the "...ещё".
+  const rawCaption = (parsed.caption || '').trim();
+  const caption = rawCaption.length > 80 ? rawCaption.slice(0, 79).replace(/\s+\S*$/, '') + '…' : rawCaption;
+
+  // Hashtag hard-limit: 5 max, unique, ensure #yupsoul present.
+  const tags = Array.from(new Set((parsed.hashtags || [])
+    .map((t) => String(t).trim())
+    .filter((t) => t.startsWith('#'))))
+    .slice(0, 5);
+  if (!tags.some((t) => t.toLowerCase() === '#yupsoul')) {
+    if (tags.length >= 5) tags.pop();
+    tags.push('#yupsoul');
+  }
+
   return {
     title: parsed.title || 'YupSoul Video',
     zodiacSign: opts.zodiacSign,
     zodiacSign2: opts.zodiacSign2,
     rubric: opts.rubric,
     scenes,
-    caption: parsed.caption || '',
-    hashtags: parsed.hashtags || ['#астрология', '#гороскоп', '#рек', '#yupsoul'],
+    caption,
+    hashtags: tags.length ? tags : ['#рек', '#астрология', '#гороскоп', '#музыка', '#yupsoul'],
     totalDuration,
     music: parsed.music || 'cosmic_ambient',
   };

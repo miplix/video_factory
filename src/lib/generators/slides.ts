@@ -595,17 +595,21 @@ export async function renderAllSlides(
   const aiEnabled = process.env.DISABLE_AI_BACKGROUND !== '1';
   const seedBase = hashStr(themeSeed || 'yupsoul');
 
-  // 1) Fetch AI backgrounds for every scene in parallel. Each failure
-  // resolves to null and the slide falls back to the brand gradient.
-  const backgrounds: (string | undefined)[] = await Promise.all(
-    scenes.map(async (scene, i) => {
-      if (!aiEnabled) return undefined;
-      const prompt = buildScenePrompt(scene, rubric, zodiacSign, zodiacSign2);
-      const seed = (seedBase + i * 7919) % 1_000_000;
-      const buf = await fetchPollinationsImage(prompt, seed);
-      return buf ? bufferToDataUrl(buf) : undefined;
-    }),
-  );
+  // 1) Fetch AI backgrounds SEQUENTIALLY. Pollinations serializes requests
+  // per client IP — firing 6 in parallel means only the first gets prompt
+  // service and the rest time out. Sequential with a tight per-request
+  // timeout respects their queue and fits in the serverless 60s budget.
+  // On any failure the slide silently falls back to the brand gradient.
+  const backgrounds: (string | undefined)[] = [];
+  for (let i = 0; i < scenes.length; i++) {
+    if (!aiEnabled) { backgrounds.push(undefined); continue; }
+    const prompt = buildScenePrompt(scenes[i], rubric, zodiacSign, zodiacSign2);
+    const seed = (seedBase + i * 7919) % 1_000_000;
+    const started = Date.now();
+    const buf = await fetchPollinationsImage(prompt, seed);
+    console.log(`[pollinations] slide ${i}: ${buf ? `${buf.length}B` : 'miss'} in ${Date.now() - started}ms`);
+    backgrounds.push(buf ? bufferToDataUrl(buf) : undefined);
+  }
 
   // 2) Render slides sequentially — Satori+Resvg is CPU-bound, parallelizing
   // doesn't help and increases peak memory.

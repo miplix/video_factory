@@ -71,12 +71,14 @@ export async function fetchPollinationsImage(
   const hit = _cache.get(cacheKey);
   if (hit) return hit;
 
+  // `enhance` is server-side prompt rewriting — adds 3-5s per request, skip it.
+  // `nofeed=true` skips the public feed / may hit caches faster.
   const url =
     `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}` +
-    `?width=1080&height=1920&model=flux&nologo=true&enhance=true&seed=${seed}`;
+    `?width=1080&height=1920&model=flux&nologo=true&nofeed=true&seed=${seed}`;
 
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(45000) });
+    const res = await fetch(url, { signal: AbortSignal.timeout(18000) });
     if (!res.ok) {
       console.warn(`[pollinations] ${res.status} — falling back to gradient`);
       return null;

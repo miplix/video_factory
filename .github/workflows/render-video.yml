@@ -717,7 +717,9 @@ jobs:
           #   music base volume=0.55 (quieter baseline), then heavy sidechain compression
           #   (threshold=0.03, ratio=20, fast attack=5ms) drops it ~14dB under speech → ~20%.
           #   release=280ms so music recovers quickly between words.
-          DUCK_FILTER="[1:a]volume=0.95,asplit=2[voice_out][voice_sc];[2:a]volume=0.55[mloud];[mloud][voice_sc]sidechaincompress=threshold=0.03:ratio=20:attack=5:release=280:makeup=0[mduck];[voice_out][mduck]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[mix];[mix]acompressor=threshold=-1dB:ratio=2:attack=5:release=80[a]"
+          # Note: ffmpeg sidechaincompress requires makeup ≥ 1 (1 = no gain, the
+          # minimum the filter accepts). Passing 0 is rejected as out-of-range.
+          DUCK_FILTER="[1:a]volume=0.95,asplit=2[voice_out][voice_sc];[2:a]volume=0.55[mloud];[mloud][voice_sc]sidechaincompress=threshold=0.03:ratio=20:attack=5:release=280:makeup=1[mduck];[voice_out][mduck]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[mix];[mix]acompressor=threshold=-1dB:ratio=2:attack=5:release=80[a]"
 
           if [ "$HAVE_VOICE" = "yes" ] && [ "$HAVE_MUSIC" = "yes" ]; then
             ffmpeg -y -i /tmp/render/video_final.mp4 \

@@ -38,6 +38,11 @@ on:
         required: false
         default: ''
         type: string
+      scene_prompts:
+        description: 'JSON array of Pollinations prompts — one per scene. Empty = gradient fallback.'
+        required: false
+        default: '[]'
+        type: string
 
 jobs:
   render:
@@ -75,6 +80,118 @@ jobs:
           PYEOF
         env:
           SLIDE_URLS: ${{ inputs.slide_urls }}
+
+      - name: Fetch AI backgrounds (Pollinations FLUX)
+        env:
+          SCENE_PROMPTS: ${{ inputs.scene_prompts }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          mkdir -p /tmp/render/ai_bg
+          python3 - <<'PYEOF'
+          import json, os, hashlib, urllib.parse, urllib.request, socket, ssl, subprocess
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          prompts = []
+          try:
+              prompts = json.loads(os.environ.get('SCENE_PROMPTS', '[]'))
+          except Exception as e:
+              print(f"⚠ bad SCENE_PROMPTS: {e}")
+          job_seed = int(hashlib.sha1(os.environ.get('JOB_ID', 'x').encode()).hexdigest()[:8], 16)
+
+          import glob
+          slide_count = len(glob.glob('/tmp/render/slides/slide_*.png'))
+          if not prompts:
+              print(f"No scene_prompts — generating {slide_count} gradient fallbacks")
+              prompts = [''] * slide_count
+          while len(prompts) < slide_count:
+              prompts.append('')
+
+          GRAD_COLORS = [
+              ('0x2D1B69', '0x0A0A1A'),  # deep purple → near-black
+              ('0x4A2980', '0x12122E'),  # mid purple
+              ('0x1A3A5C', '0x0A0A1A'),  # deep blue
+              ('0x5C2A4A', '0x120A1E'),  # burgundy
+              ('0x2B4A3B', '0x0A1A14'),  # deep teal
+              ('0x3B2A5C', '0x0A0A1A'),  # indigo
+          ]
+
+          def make_gradient(idx, out_path):
+              c0, c1 = GRAD_COLORS[idx % len(GRAD_COLORS)]
+              # Smooth vertical gradient via ffmpeg lavfi.
+              subprocess.run([
+                  'ffmpeg', '-y', '-f', 'lavfi',
+                  '-i', f'gradients=size=1080x1920:c0={c0}:c1={c1}:x0=540:y0=0:x1=540:y1=1920:duration=0.1',
+                  '-frames:v', '1', '-q:v', '3', out_path,
+              ], check=True, capture_output=True)
+
+          def fetch_one(idx, prompt):
+              out = f'/tmp/render/ai_bg/bg_{idx:02d}.jpg'
+              if not prompt.strip():
+                  make_gradient(idx, out); return (idx, 'gradient', 0)
+              seed = (job_seed + idx * 7919) % 1_000_000
+              # nofeed=true skips public feed, nologo removes watermark,
+              # enhance=false skips server-side prompt rewriting (saves latency).
+              url = (
+                  'https://image.pollinations.ai/prompt/'
+                  + urllib.parse.quote(prompt, safe='')
+                  + f'?width=1080&height=1920&model=flux&nologo=true&nofeed=true&enhance=false&seed={seed}'
+              )
+              import time
+              for attempt in (1, 2, 3):
+                  try:
+                      started = time.time()
+                      req = urllib.request.Request(url, headers={'User-Agent': 'video-factory/1.0'})
+                      with urllib.request.urlopen(req, timeout=90) as r:
+                          data = r.read()
+                      if len(data) < 3000:
+                          raise RuntimeError(f'tiny payload {len(data)}B')
+                      with open(out, 'wb') as f: f.write(data)
+                      dt = time.time() - started
+                      return (idx, f'pollinations ({len(data)//1024}KB, attempt {attempt})', dt)
+                  except Exception as e:
+                      print(f"  slide {idx} attempt {attempt} failed: {e}")
+                      time.sleep(2 * attempt)
+              # All attempts failed → gradient fallback.
+              make_gradient(idx, out)
+              return (idx, 'fallback (pollinations failed)', 0)
+
+          # Pollinations tolerates modest concurrency per IP — 3 works well.
+          with ThreadPoolExecutor(max_workers=3) as ex:
+              futures = [ex.submit(fetch_one, i, p) for i, p in enumerate(prompts[:slide_count])]
+              results = [f.result() for f in as_completed(futures)]
+
+          for idx, kind, dt in sorted(results):
+              print(f"  bg_{idx:02d}: {kind} ({dt:.1f}s)")
+          print(f"✅ AI backgrounds ready: {slide_count}")
+          PYEOF
+          ls -lh /tmp/render/ai_bg/
+
+      - name: Composite slides over AI backgrounds
+        run: |
+          python3 - <<'PYEOF'
+          import glob, os, subprocess
+          slides = sorted(glob.glob('/tmp/render/slides/slide_*.png'))
+          for slide in slides:
+              idx = os.path.basename(slide).split('_')[1].split('.')[0]
+              bg = f'/tmp/render/ai_bg/bg_{idx}.jpg'
+              if not os.path.exists(bg):
+                  print(f"  slide {idx}: no bg — keeping as-is"); continue
+              out = f'/tmp/render/slides/slide_{idx}_composed.png'
+              # AI bg as base + transparent slide (with darkening overlay + text) on top.
+              r = subprocess.run([
+                  'ffmpeg', '-y', '-i', bg, '-i', slide,
+                  '-filter_complex',
+                  '[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[base];'
+                  '[base][1:v]overlay=0:0:format=auto,format=rgba[v]',
+                  '-map', '[v]', '-frames:v', '1', out,
+              ], capture_output=True, text=True)
+              if r.returncode != 0:
+                  print(f"  slide {idx}: composite failed — keeping original\n{r.stderr[-300:]}")
+                  continue
+              os.replace(out, slide)
+              print(f"  slide {idx}: composited over {os.path.basename(bg)}")
+          PYEOF
+          ls -lh /tmp/render/slides/
 
       - name: Generate voiceover with edge-tts
         env:

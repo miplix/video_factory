@@ -31,7 +31,8 @@ function sealSentence(text: string): string {
 export async function triggerVideoRender(
   job: VideoJob,
   config: AppConfig,
-  webhookBaseUrl: string
+  webhookBaseUrl: string,
+  scenePrompts: string[] = [],
 ): Promise<{ runId?: string; error?: string }> {
   // Build full voiceover text (all scenes joined), normalized for Russian TTS
   const rawVoiceover = (job.script?.scenes || [])
@@ -68,6 +69,7 @@ export async function triggerVideoRender(
         webhook_url: `${webhookBaseUrl}/api/render/complete`,
         webhook_secret: config.renderWebhookSecret,
         caption: tgCaption,
+        scene_prompts: JSON.stringify(scenePrompts),
       },
     }),
   });

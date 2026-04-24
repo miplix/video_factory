@@ -5,6 +5,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { loadConfig } from '@/lib/config';
 import { generateVideoScript, pickRandomTopic } from '@/lib/generators/script';
 import { renderAllSlides } from '@/lib/generators/slides';
+import { buildAllScenePrompts } from '@/lib/generators/ai-background';
 import { uploadBuffer } from '@/lib/storage/r2';
 import { triggerVideoRender } from '@/lib/github';
 import { saveJob, generateId } from '@/lib/db';
@@ -93,7 +94,15 @@ export async function POST(req: NextRequest) {
     const baseUrl = process.env.NEXT_PUBLIC_BASE_URL
       || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://localhost:3000');
 
-    const { runId, error: ghError } = await triggerVideoRender(job, config, baseUrl);
+    // Per-scene Pollinations prompts — CI fetches the actual images.
+    const scenePrompts = buildAllScenePrompts(
+      script.scenes,
+      script.rubric,
+      script.zodiacSign,
+      script.zodiacSign2,
+    );
+
+    const { runId, error: ghError } = await triggerVideoRender(job, config, baseUrl, scenePrompts);
 
     if (ghError) {
       job.status = 'failed';

@@ -1,7 +1,9 @@
 // ============================================================
-// AI Background Generator — Pollinations.ai (free, no key)
-// Builds a theme-aware prompt from scene + rubric + zodiac sign
-// and fetches a 1080×1920 PNG. Used as backdrop behind Satori text.
+// AI Background Prompt Builder
+// The actual Pollinations HTTP fetch happens in GitHub Actions
+// (see render-video.yml "Fetch AI backgrounds" step) — Vercel's
+// 60s function cap is too tight for 6 serialized inference calls.
+// This module only builds the prompt strings that get passed to CI.
 // ============================================================
 import type { VideoScene, ZodiacSign, ContentRubric } from '../types';
 
@@ -54,53 +56,17 @@ export function buildScenePrompt(
   if (rubric) parts.push(RUBRIC_STYLE[rubric]);
   if (sign) parts.push(SIGN_IMAGERY[sign]);
   if (sign2) parts.push(SIGN_IMAGERY[sign2]);
-  // Scene text hint — lets each slide diverge visually while staying on-topic.
   const hint = sanitize(scene.body || scene.heading);
   if (hint) parts.push(`mood: ${hint}`);
   parts.push(BASE_STYLE);
   return parts.join(', ');
 }
 
-const _cache = new Map<string, Buffer>();
-
-export async function fetchPollinationsImage(
-  prompt: string,
-  seed: number,
-): Promise<Buffer | null> {
-  const cacheKey = `${seed}|${prompt}`;
-  const hit = _cache.get(cacheKey);
-  if (hit) return hit;
-
-  // `enhance` is server-side prompt rewriting — adds 3-5s per request, skip it.
-  // `nofeed=true` skips the public feed / may hit caches faster.
-  const url =
-    `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}` +
-    `?width=1080&height=1920&model=flux&nologo=true&nofeed=true&seed=${seed}`;
-
-  try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(18000) });
-    if (!res.ok) {
-      console.warn(`[pollinations] ${res.status} — falling back to gradient`);
-      return null;
-    }
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length < 2000) {
-      console.warn(`[pollinations] tiny payload (${buf.length}B) — treating as failure`);
-      return null;
-    }
-    _cache.set(cacheKey, buf);
-    return buf;
-  } catch (e) {
-    console.warn('[pollinations] fetch error:', (e as Error).message);
-    return null;
-  }
-}
-
-export function bufferToDataUrl(buf: Buffer): string {
-  // Sniff magic bytes — Pollinations usually returns JPEG, occasionally PNG.
-  const mime =
-    buf[0] === 0x89 && buf[1] === 0x50 ? 'image/png' :
-    buf[0] === 0xff && buf[1] === 0xd8 ? 'image/jpeg' :
-    'image/jpeg';
-  return `data:${mime};base64,${buf.toString('base64')}`;
+export function buildAllScenePrompts(
+  scenes: VideoScene[],
+  rubric?: ContentRubric,
+  sign?: ZodiacSign,
+  sign2?: ZodiacSign,
+): string[] {
+  return scenes.map(s => buildScenePrompt(s, rubric, sign, sign2));
 }

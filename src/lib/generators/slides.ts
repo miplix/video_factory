@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { VideoScene, ZodiacSign, ContentRubric } from '../types';
 import { ZODIAC_RU, ZODIAC_EMOJI } from '../types';
+import { buildScenePrompt, fetchPollinationsImage, bufferToDataUrl } from './ai-background';
 
 const W = 1080;
 const H = 1920;
@@ -241,10 +242,11 @@ export interface RenderSlideOptions {
   zodiacSign2?: ZodiacSign;
   rubric?: ContentRubric;
   themeSeed?: string; // jobId or title — keeps one video cohesive
+  aiBackgroundDataUrl?: string; // Pollinations AI image, falls back to gradient if absent
 }
 
 export async function renderSlide(opts: RenderSlideOptions): Promise<Buffer> {
-  const { scene, sceneIndex, zodiacSign, zodiacSign2, rubric, themeSeed } = opts;
+  const { scene, sceneIndex, zodiacSign, zodiacSign2, rubric, themeSeed, aiBackgroundDataUrl } = opts;
   const fonts = loadFonts();
 
   const isHook = scene.isHook || sceneIndex === 0;
@@ -266,22 +268,60 @@ export async function renderSlide(opts: RenderSlideOptions): Promise<Buffer> {
   const signText = zodiacSign ? `${ZODIAC_EMOJI[zodiacSign]} ${ZODIAC_RU[zodiacSign]}` : '';
   const sign2Text = zodiacSign2 ? ` × ${ZODIAC_EMOJI[zodiacSign2]} ${ZODIAC_RU[zodiacSign2]}` : '';
 
+  // When we have an AI image, it goes in as a full-bleed <img>, with a
+  // strong gradient overlay on top so headlines stay legible on any scene.
+  // Without AI, the root itself carries the brand gradient (original behavior).
+  const rootStyle: Record<string, unknown> = {
+    width: W,
+    height: H,
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontFamily: '"Inter", sans-serif',
+    position: 'relative',
+    overflow: 'hidden',
+  };
+  if (!aiBackgroundDataUrl) rootStyle.background = bg;
+
   const jsx = {
     type: 'div',
     props: {
-      style: {
-        width: W,
-        height: H,
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        justifyContent: 'center',
-        background: bg,
-        fontFamily: '"Inter", sans-serif',
-        position: 'relative',
-        overflow: 'hidden',
-      },
+      style: rootStyle,
       children: [
+        // AI background image (full-bleed) — absent = fallback gradient on root
+        aiBackgroundDataUrl ? {
+          type: 'img',
+          props: {
+            src: aiBackgroundDataUrl,
+            width: W,
+            height: H,
+            style: {
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              width: W,
+              height: H,
+              objectFit: 'cover',
+            },
+          },
+        } : null,
+        // Darkening gradient overlay — readable text over any image.
+        // Darker at top/bottom where headline + CTA sit, lighter mid-frame.
+        aiBackgroundDataUrl ? {
+          type: 'div',
+          props: {
+            style: {
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              width: W,
+              height: H,
+              background:
+                'linear-gradient(180deg, rgba(10,10,26,0.78) 0%, rgba(10,10,26,0.35) 35%, rgba(10,10,26,0.35) 65%, rgba(10,10,26,0.85) 100%)',
+            },
+          },
+        } : null,
         // Top glow orb
         {
           type: 'div',
@@ -551,6 +591,24 @@ export async function renderAllSlides(
   rubric?: ContentRubric,
   themeSeed?: string,
 ): Promise<Buffer[]> {
+  // Pollinations can be disabled via env for deterministic/offline renders.
+  const aiEnabled = process.env.DISABLE_AI_BACKGROUND !== '1';
+  const seedBase = hashStr(themeSeed || 'yupsoul');
+
+  // 1) Fetch AI backgrounds for every scene in parallel. Each failure
+  // resolves to null and the slide falls back to the brand gradient.
+  const backgrounds: (string | undefined)[] = await Promise.all(
+    scenes.map(async (scene, i) => {
+      if (!aiEnabled) return undefined;
+      const prompt = buildScenePrompt(scene, rubric, zodiacSign, zodiacSign2);
+      const seed = (seedBase + i * 7919) % 1_000_000;
+      const buf = await fetchPollinationsImage(prompt, seed);
+      return buf ? bufferToDataUrl(buf) : undefined;
+    }),
+  );
+
+  // 2) Render slides sequentially — Satori+Resvg is CPU-bound, parallelizing
+  // doesn't help and increases peak memory.
   const buffers: Buffer[] = [];
   for (let i = 0; i < scenes.length; i++) {
     const buf = await renderSlide({
@@ -561,6 +619,7 @@ export async function renderAllSlides(
       zodiacSign2,
       rubric,
       themeSeed,
+      aiBackgroundDataUrl: backgrounds[i],
     });
     buffers.push(buf);
   }

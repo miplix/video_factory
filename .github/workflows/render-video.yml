@@ -321,6 +321,80 @@ jobs:
           PYEOF
           ls -lh /tmp/render/scene_video/ 2>/dev/null || true
 
+      - name: Generate particle overlays (stars + bokeh)
+        run: |
+          python3 - <<'PYEOF'
+          # Build alpha-PNG overlay assets (stars + soft bokeh) used in segment
+          # build to sit on top of every scene with slow drift. PNG canvas is
+          # 1.5× the video so ffmpeg overlay can pan through it for motion.
+          from PIL import Image, ImageDraw, ImageFilter
+          import random
+
+          W, H = 1620, 2880  # 1.5× of 1080×1920
+
+          # ---- Stars layer: 3 density tiers, soft glow on the brighter ones ---
+          stars = Image.new('RGBA', (W, H), (0, 0, 0, 0))
+          d = ImageDraw.Draw(stars)
+          random.seed(7)
+
+          # Tier 1: tiny background dust (lots, dim)
+          for _ in range(700):
+              x, y = random.randint(0, W-1), random.randint(0, H-1)
+              a = random.randint(50, 130)
+              d.point((x, y), fill=(255, 255, 255, a))
+
+          # Tier 2: small visible stars (medium count, varied colors)
+          for _ in range(180):
+              x, y = random.randint(2, W-3), random.randint(2, H-3)
+              r = random.choice([1, 1, 2])
+              a = random.randint(150, 220)
+              c = random.choice([
+                  (255, 255, 255, a),
+                  (220, 230, 255, a),  # cool
+                  (255, 240, 210, a),  # warm
+                  (200, 220, 255, a),  # very cool
+                  (255, 220, 240, a),  # pink-tinted
+              ])
+              d.ellipse([x-r, y-r, x+r, y+r], fill=c)
+
+          # Tier 3: rare diamond/cross sparkles (eye-catchers)
+          for _ in range(20):
+              x, y = random.randint(40, W-40), random.randint(40, H-40)
+              s = random.choice([3, 4, 5])
+              # 4-point star
+              d.polygon([
+                  (x, y-s*2), (x+s//2, y-s//2), (x+s*2, y), (x+s//2, y+s//2),
+                  (x, y+s*2), (x-s//2, y+s//2), (x-s*2, y), (x-s//2, y-s//2),
+              ], fill=(255, 250, 220, 230))
+
+          # Soft glow: blur a copy and screen-blend back so stars have halos
+          # without losing their core sharpness.
+          glow = stars.filter(ImageFilter.GaussianBlur(radius=1.8))
+          stars_final = Image.alpha_composite(glow, stars)
+          stars_final.save('/tmp/render/overlay_stars.png')
+
+          # ---- Bokeh layer: bigger soft circles, more sparse, color-tinted ----
+          bokeh = Image.new('RGBA', (W, H), (0, 0, 0, 0))
+          d2 = ImageDraw.Draw(bokeh)
+          random.seed(13)
+          for _ in range(40):
+              x, y = random.randint(0, W), random.randint(0, H)
+              r = random.choice([18, 22, 28, 36, 48])
+              a = random.randint(40, 110)
+              c = random.choice([
+                  (180, 200, 255, a),  # cool blue
+                  (255, 220, 180, a),  # warm gold
+                  (220, 180, 255, a),  # lavender
+                  (255, 200, 230, a),  # pink
+              ])
+              d2.ellipse([x-r, y-r, x+r, y+r], fill=c)
+          bokeh = bokeh.filter(ImageFilter.GaussianBlur(radius=8))
+          bokeh.save('/tmp/render/overlay_bokeh.png')
+
+          print('✅ overlay_stars.png + overlay_bokeh.png generated')
+          PYEOF
+          ls -lh /tmp/render/overlay_*.png
+
       - name: Composite slides over AI backgrounds
         run: |
           python3 - <<'PYEOF'
@@ -823,6 +897,39 @@ jobs:
           broll = sorted(glob.glob('/tmp/render/broll/broll_*.mp4'))
           print(f"Sources: {len(slides)} slides, {len(scene_videos)} HF-anim, {len(broll)} B-roll, luma={'yes' if luma_path else 'no'}")
 
+          # Per-scene drift patterns for the stars + bokeh overlays. Each scene
+          # picks one so neighbouring segments move differently — the floating
+          # particles sell the "alive screen" feel even on static-source frames.
+          stars_drift = [
+              "x='-(w-W)/2 + 80*sin(2*PI*t/12)':y='-(h-H)/2 + 80*cos(2*PI*t/15)'",
+              "x='-(w-W)/2 + 0.012*W*t':y='-(h-H)/2 + 30*sin(2*PI*t/8)'",
+              "x='-(w-W)/2 + 30*sin(2*PI*t/10)':y='-(h-H)/2 + 0.010*H*t'",
+              "x='-(w-W)/2':y='-(h-H)/2 + 0.012*H*t'",
+              "x='-(w-W)/2 - 0.008*W*t':y='-(h-H)/2 + 0.008*H*t'",
+              "x='-(w-W)/2 + 50*cos(2*PI*t/9)':y='-(h-H)/2 + 50*sin(2*PI*t/11)'",
+          ]
+          bokeh_drift = [
+              # Bokeh moves opposite/slower for parallax depth illusion
+              "x='-(w-W)/2 - 60*sin(2*PI*t/18)':y='-(h-H)/2 + 0.004*H*t'",
+              "x='-(w-W)/2 - 0.005*W*t':y='-(h-H)/2 + 40*sin(2*PI*t/14)'",
+              "x='-(w-W)/2 + 40*sin(2*PI*t/16)':y='-(h-H)/2 - 0.003*H*t'",
+              "x='-(w-W)/2 + 0.003*W*t':y='-(h-H)/2 - 0.004*H*t'",
+              "x='-(w-W)/2 + 70*cos(2*PI*t/20)':y='-(h-H)/2 + 70*sin(2*PI*t/17)'",
+              "x='-(w-W)/2':y='-(h-H)/2 - 0.006*H*t'",
+          ]
+
+          STARS = '/tmp/render/overlay_stars.png'
+          BOKEH = '/tmp/render/overlay_bokeh.png'
+
+          def fx_chain(in_label, scene_idx, stars_in, bokeh_in, out_label):
+              """Append stars + bokeh overlays with per-scene drift to a base label."""
+              s_drift = stars_drift[scene_idx % len(stars_drift)]
+              b_drift = bokeh_drift[scene_idx % len(bokeh_drift)]
+              return (
+                  f"{in_label}{bokeh_in}overlay={b_drift}:format=auto:eof_action=repeat[fxb];"
+                  f"[fxb]{stars_in}overlay={s_drift}:format=auto:eof_action=repeat,format=yuv420p{out_label}"
+              )
+
           # Motion-Ken-Burns presets — random pan direction + zoom variation. More
           # dynamic than the old fixed-center variants so even fallback feels alive.
           # Format: (zoom_expr, x_expr, y_expr).
@@ -858,50 +965,78 @@ jobs:
               out = f'/tmp/render/seg_{i:02d}.mp4'
               frames = int(dur * 30)
 
+              # All branches now route through filter_complex and pin the
+              # bokeh + stars overlays as the last two inputs (so we always
+              # get drifting particles even on Ken Burns / Luma fallbacks).
+              # Per-scene drift makes neighbouring segments move differently.
+
               # Per-scene HF-animated video (preferred). Use transparent slide
               # overlay so brand text rides on top of the moving AI clip.
               if i in scene_videos:
                   clip = scene_videos[i]
                   text_overlay = f'/tmp/render/slides_transparent/slide_{i:02d}.png'
                   if not os.path.exists(text_overlay):
-                      text_overlay = slide  # fallback to composited if transparent missing
+                      text_overlay = slide
+                  fx = fx_chain('[withtext]', i, '[3:v]', '[2:v]', '[v]')
                   cmd = [
-                      'ffmpeg', '-y', '-stream_loop', '-1', '-i', clip, '-i', text_overlay,
+                      'ffmpeg', '-y',
+                      '-stream_loop', '-1', '-i', clip,
+                      '-i', text_overlay,
+                      '-i', BOKEH,
+                      '-i', STARS,
                       '-filter_complex',
                       '[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,eq=brightness=-0.05:saturation=1.10[bg];'
-                      '[bg][1:v]overlay=0:0:format=auto,format=yuv420p[v]',
+                      '[bg][1:v]overlay=0:0:format=auto[withtext];'
+                      + fx,
                       '-map', '[v]', '-t', str(dur),
                       '-c:v', 'libx264', '-preset', 'fast', '-crf', '22', '-an', out,
                   ]
               # Luma on hook scene (0) if available and no per-scene clip there
               elif i == 0 and luma_path:
+                  fx = fx_chain('[bg]', i, '[2:v]', '[1:v]', '[v]')
                   cmd = [
-                      'ffmpeg', '-y', '-stream_loop', '-1', '-i', luma_path,
-                      '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30',
-                      '-t', str(dur), '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+                      'ffmpeg', '-y',
+                      '-stream_loop', '-1', '-i', luma_path,
+                      '-i', BOKEH,
+                      '-i', STARS,
+                      '-filter_complex',
+                      '[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30[bg];'
+                      + fx,
+                      '-map', '[v]', '-t', str(dur),
+                      '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
                       '-pix_fmt', 'yuv420p', '-an', out,
                   ]
               # B-roll on assigned middle scenes
               elif i in broll_slots:
                   clip = broll_slots[i]
+                  fx = fx_chain('[withtext]', i, '[3:v]', '[2:v]', '[v]')
                   cmd = [
-                      'ffmpeg', '-y', '-stream_loop', '-1', '-i', clip, '-i', slide,
+                      'ffmpeg', '-y',
+                      '-stream_loop', '-1', '-i', clip,
+                      '-i', slide,
+                      '-i', BOKEH,
+                      '-i', STARS,
                       '-filter_complex',
                       '[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,eq=brightness=-0.10[bg];'
-                      '[bg][1:v]overlay=0:0:format=auto,format=yuv420p[v]',
+                      '[bg][1:v]overlay=0:0:format=auto[withtext];'
+                      + fx,
                       '-map', '[v]', '-t', str(dur),
                       '-c:v', 'libx264', '-preset', 'fast', '-crf', '22', '-an', out,
                   ]
               # Default: Motion Ken Burns on the (composited) slide
               else:
                   z, x, y = motion_kb[i % len(motion_kb)]
-                  vf = (
-                      f'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,'
-                      f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s=1080x1920:fps=30"
-                  )
+                  fx = fx_chain('[bg]', i, '[2:v]', '[1:v]', '[v]')
                   cmd = [
-                      'ffmpeg', '-y', '-loop', '1', '-i', slide,
-                      '-vf', vf, '-t', str(dur),
+                      'ffmpeg', '-y',
+                      '-loop', '1', '-i', slide,
+                      '-i', BOKEH,
+                      '-i', STARS,
+                      '-filter_complex',
+                      f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+                      f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s=1080x1920:fps=30[bg];"
+                      + fx,
+                      '-map', '[v]', '-t', str(dur),
                       '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
                       '-pix_fmt', 'yuv420p', '-an', out,
                   ]

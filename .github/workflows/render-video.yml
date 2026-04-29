@@ -223,18 +223,124 @@ jobs:
           PYEOF
           ls -lh /tmp/render/ai_bg/
 
+      - name: Animate per-scene videos (HF text-to-video chain)
+        env:
+          HF_API_TOKEN: ${{ secrets.HF_API_TOKEN }}
+          SCENE_PROMPTS: ${{ inputs.scene_prompts }}
+          DURATIONS: ${{ inputs.scene_durations }}
+        run: |
+          mkdir -p /tmp/render/scene_video
+          python3 - <<'PYEOF'
+          import os, json, time, glob, urllib.request, urllib.error
+
+          hf_token = os.environ.get('HF_API_TOKEN', '').strip()
+          if not hf_token:
+              print("⚠ HF_API_TOKEN not set — skipping per-scene video, fallback to motion-Ken-Burns")
+              exit(0)
+
+          try:
+              prompts = json.loads(os.environ.get('SCENE_PROMPTS', '[]'))
+          except Exception:
+              prompts = []
+          slide_count = len(glob.glob('/tmp/render/slides/slide_*.png'))
+          while len(prompts) < slide_count:
+              prompts.append('')
+
+          # Models tried in order. Each is HF Inference Serverless POST → mp4 bytes.
+          # If the first 404s/403s/serves an empty payload, we fall through to the
+          # next; if all fail we leave scene_video/ empty and let the segment
+          # builder use motion-Ken-Burns over the AI bg image instead.
+          MODELS = [
+              ('Lightricks/LTX-Video', {'num_frames': 121, 'guidance_scale': 3.0}),  # 5s @ 24fps, portrait OK
+              ('cerspense/zeroscope_v2_576w', {}),  # legacy 16:9 fallback
+          ]
+          MIN_BYTES = 80_000  # real mp4 ≥ ~100KB even at low quality
+
+          def try_model(model_id, prompt, params):
+              url = f'https://api-inference.huggingface.co/models/{model_id}'
+              body = json.dumps({
+                  'inputs': prompt,
+                  'parameters': params,
+              }).encode()
+              for attempt in (1, 2):
+                  try:
+                      req = urllib.request.Request(
+                          url, data=body,
+                          headers={
+                              'Authorization': f'Bearer {hf_token}',
+                              'Content-Type': 'application/json',
+                              'Accept': 'video/mp4',
+                          },
+                          method='POST',
+                      )
+                      with urllib.request.urlopen(req, timeout=240) as r:
+                          data = r.read()
+                      if len(data) < MIN_BYTES:
+                          raise RuntimeError(f'tiny payload {len(data)}B')
+                      return data
+                  except urllib.error.HTTPError as e:
+                      # 503 = model loading; 429 = rate limit; both worth waiting.
+                      if e.code == 503 and attempt == 1:
+                          print(f"    [{model_id}] 503 loading, waiting 30s")
+                          time.sleep(30); continue
+                      if e.code == 429 and attempt == 1:
+                          print(f"    [{model_id}] 429 rate-limit, waiting 30s")
+                          time.sleep(30); continue
+                      raise RuntimeError(f'HTTP {e.code}: {e.reason}')
+              raise RuntimeError('attempts exhausted')
+
+          successes = 0
+          for i in range(slide_count):
+              prompt = (prompts[i] if i < len(prompts) else '').strip()
+              if not prompt:
+                  continue
+              # Add motion-friendly hints to the existing image-style prompt.
+              video_prompt = (
+                  prompt + ', cinematic slow camera movement, gentle drift, '
+                  'subtle parallax, dreamy motion, 4 seconds'
+              )
+              out = f'/tmp/render/scene_video/scene_{i:02d}.mp4'
+              started = time.time()
+              done = False
+              for model_id, params in MODELS:
+                  try:
+                      print(f"  scene {i}: trying {model_id}...")
+                      data = try_model(model_id, video_prompt, params)
+                      with open(out, 'wb') as f: f.write(data)
+                      dt = time.time() - started
+                      print(f"  scene_{i:02d}: ✅ {model_id} ({len(data)//1024}KB, {dt:.1f}s)")
+                      successes += 1; done = True; break
+                  except Exception as e:
+                      print(f"  scene {i} {model_id}: {e}")
+              if not done:
+                  print(f"  scene_{i:02d}: ❌ all models failed — Ken Burns fallback will kick in")
+              # Pace requests so we don't hammer HF.
+              time.sleep(3)
+
+          print(f"✅ {successes}/{slide_count} per-scene videos generated")
+          PYEOF
+          ls -lh /tmp/render/scene_video/ 2>/dev/null || true
+
       - name: Composite slides over AI backgrounds
         run: |
           python3 - <<'PYEOF'
-          import glob, os, subprocess
+          import glob, os, shutil, subprocess
+
+          # Save transparent (text-only) slide copies BEFORE compositing — used
+          # later as overlay on per-scene videos so the text rides on top of the
+          # animated AI clip instead of a baked-in still bg.
+          os.makedirs('/tmp/render/slides_transparent', exist_ok=True)
+
           slides = sorted(glob.glob('/tmp/render/slides/slide_*.png'))
           for slide in slides:
               idx = os.path.basename(slide).split('_')[1].split('.')[0]
+              shutil.copy(slide, f'/tmp/render/slides_transparent/slide_{idx}.png')
+
               bg = f'/tmp/render/ai_bg/bg_{idx}.jpg'
               if not os.path.exists(bg):
                   print(f"  slide {idx}: no bg — keeping as-is"); continue
               out = f'/tmp/render/slides/slide_{idx}_composed.png'
-              # AI bg as base + transparent slide (with darkening overlay + text) on top.
+              # AI bg as base + transparent slide (darkening overlay + text) on top.
               r = subprocess.run([
                   'ffmpeg', '-y', '-i', bg, '-i', slide,
                   '-filter_complex',
@@ -682,7 +788,8 @@ jobs:
               durations.append(4)
 
           # --- Voice-length safety (must run before xfade shrinkage calc).
-          XFADE = 0.5
+          # Shorter xfade (0.3s, was 0.5s) → punchier rhythm.
+          XFADE = 0.3
           shrink = (len(slides) - 1) * XFADE
           voice_path = '/tmp/render/voiceover.mp3'
           if os.path.exists(voice_path):
@@ -702,41 +809,72 @@ jobs:
               except Exception as e:
                   print(f"⚠ ffprobe failed: {e}")
 
-          # --- Per-scene source: Luma (hook) / B-roll (available) / Ken Burns slide.
+          # --- Per-scene source priority:
+          # 1. HF-animated per-scene mp4 (preferred — real motion under brand text)
+          # 2. Luma hook clip (legacy single-clip chain, scene 0 only)
+          # 3. Pexels B-roll (round-robin)
+          # 4. Motion-Ken-Burns on the composited slide (varied pan + zoom)
+          scene_videos = {}
+          for i in range(len(slides)):
+              p = f'/tmp/render/scene_video/scene_{i:02d}.mp4'
+              if os.path.exists(p) and os.path.getsize(p) > 50_000:
+                  scene_videos[i] = p
           luma_path = '/tmp/render/luma.mp4' if os.path.exists('/tmp/render/luma.mp4') else None
           broll = sorted(glob.glob('/tmp/render/broll/broll_*.mp4'))
-          print(f"Sources: {len(slides)} slides, {len(broll)} B-roll, luma={'yes' if luma_path else 'no'}")
+          print(f"Sources: {len(slides)} slides, {len(scene_videos)} HF-anim, {len(broll)} B-roll, luma={'yes' if luma_path else 'no'}")
 
-          zoom_configs = [
-              "z='min(zoom+0.0003,1.05)'",
-              "z='if(lte(zoom,1.0),1.05,max(1.0,zoom-0.0003))'",
-              "z='min(zoom+0.0002,1.04)'",
-              "z='1.03'",
-              "z='min(zoom+0.0004,1.06)'",
-              "z='if(lte(zoom,1.0),1.04,max(1.0,zoom-0.0002))'",
+          # Motion-Ken-Burns presets — random pan direction + zoom variation. More
+          # dynamic than the old fixed-center variants so even fallback feels alive.
+          # Format: (zoom_expr, x_expr, y_expr).
+          motion_kb = [
+              # zoom in slowly, slight rightward pan
+              ("min(zoom+0.0006,1.12)",                     "iw*0.05+0.0008*on*iw",         "ih/2-(ih/zoom/2)"),
+              # zoom out gently from punched-in start, leftward drift
+              ("if(lte(zoom,1.0),1.10,max(1.0,zoom-0.0005))", "iw*0.10-0.0007*on*iw",       "ih/2-(ih/zoom/2)"),
+              # diagonal drift (top-left to bottom-right), modest zoom
+              ("min(zoom+0.0004,1.08)",                     "iw*0.05+0.0006*on*iw",         "ih*0.05+0.0006*on*ih"),
+              # slow pulse — zoom-in, then linger
+              ("if(lt(on,30),min(zoom+0.0010,1.08),1.08)",  "iw/2-(iw/zoom/2)",              "ih/2-(ih/zoom/2)"),
+              # bottom-up tilt, light zoom
+              ("min(zoom+0.0005,1.10)",                     "iw/2-(iw/zoom/2)",              "ih*0.10-0.0008*on*ih"),
+              # rightward sweep with slow zoom
+              ("min(zoom+0.0003,1.06)",                     "iw*0.02+0.0010*on*iw",          "ih/2-(ih/zoom/2)"),
           ]
 
-          # Video-first strategy: only the CTA scene (last) stays a slide.
-          # Hook (0) = AI clip if available, else first B-roll.
-          # Middle scenes = round-robin through B-roll pool for variety.
+          # Video-first: only CTA scene (last) defaults to slide if nothing else.
+          # Per-scene HF videos win over Luma/B-roll. Pexels B-roll fills any gaps.
           n = len(slides)
-          broll_slots = {}  # scene_index -> broll_path
+          broll_slots = {}
           if broll:
-              # Fill ALL non-CTA scenes with B-roll (hook gets B-roll only if no AI clip)
-              targets = list(range(0, n - 1))
+              targets = [i for i in range(0, n - 1) if i not in scene_videos]
               if luma_path and 0 in targets:
-                  targets = [i for i in targets if i != 0]  # keep hook for AI
+                  targets = [i for i in targets if i != 0]
               for k, idx in enumerate(targets):
                   broll_slots[idx] = broll[k % len(broll)]
-          print(f"Scenes: AI=[{0 if luma_path else ''}] B-roll={sorted(broll_slots.keys())} slide=[{n-1}]")
+          print(f"Scenes: HF-anim={sorted(scene_videos.keys())} luma={[0] if luma_path and 0 not in scene_videos else []} B-roll={sorted(broll_slots.keys())} slide={[i for i in range(n) if i not in scene_videos and i not in broll_slots and not (i==0 and luma_path)]}")
 
           segments = []
           for i, (slide, dur) in enumerate(zip(slides, durations)):
               out = f'/tmp/render/seg_{i:02d}.mp4'
               frames = int(dur * 30)
 
-              # Luma on hook scene (0) if available
-              if i == 0 and luma_path:
+              # Per-scene HF-animated video (preferred). Use transparent slide
+              # overlay so brand text rides on top of the moving AI clip.
+              if i in scene_videos:
+                  clip = scene_videos[i]
+                  text_overlay = f'/tmp/render/slides_transparent/slide_{i:02d}.png'
+                  if not os.path.exists(text_overlay):
+                      text_overlay = slide  # fallback to composited if transparent missing
+                  cmd = [
+                      'ffmpeg', '-y', '-stream_loop', '-1', '-i', clip, '-i', text_overlay,
+                      '-filter_complex',
+                      '[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,eq=brightness=-0.05:saturation=1.10[bg];'
+                      '[bg][1:v]overlay=0:0:format=auto,format=yuv420p[v]',
+                      '-map', '[v]', '-t', str(dur),
+                      '-c:v', 'libx264', '-preset', 'fast', '-crf', '22', '-an', out,
+                  ]
+              # Luma on hook scene (0) if available and no per-scene clip there
+              elif i == 0 and luma_path:
                   cmd = [
                       'ffmpeg', '-y', '-stream_loop', '-1', '-i', luma_path,
                       '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30',
@@ -754,12 +892,12 @@ jobs:
                       '-map', '[v]', '-t', str(dur),
                       '-c:v', 'libx264', '-preset', 'fast', '-crf', '22', '-an', out,
                   ]
-              # Default: Ken Burns on slide
+              # Default: Motion Ken Burns on the (composited) slide
               else:
-                  z = zoom_configs[i % len(zoom_configs)]
+                  z, x, y = motion_kb[i % len(motion_kb)]
                   vf = (
                       f'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,'
-                      f"zoompan={z}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30"
+                      f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s=1080x1920:fps=30"
                   )
                   cmd = [
                       'ffmpeg', '-y', '-loop', '1', '-i', slide,
@@ -768,7 +906,11 @@ jobs:
                       '-pix_fmt', 'yuv420p', '-an', out,
                   ]
 
-              print(f"  Segment {i+1}/{n}: {dur:.2f}s [{'luma' if i==0 and luma_path else 'broll' if i in broll_slots else 'slide'}]")
+              src_kind = ('hf-anim' if i in scene_videos
+                          else 'luma' if i==0 and luma_path
+                          else 'broll' if i in broll_slots
+                          else 'motion-kb')
+              print(f"  Segment {i+1}/{n}: {dur:.2f}s [{src_kind}]")
               r = subprocess.run(cmd, capture_output=True, text=True)
               if r.returncode != 0:
                   print(f"  ⚠ failed, fallback static slide: {r.stderr[-200:]}")
@@ -780,11 +922,15 @@ jobs:
                   ], check=True)
               segments.append(out)
 
-          # --- Stitch with xfade crossfade (varied transitions).
+          # --- Stitch with xfade crossfade (varied, punchier transitions).
           if len(segments) == 1:
               subprocess.run(['cp', segments[0], '/tmp/render/video_stitched.mp4'], check=True)
           else:
-              transitions = ['fade', 'smoothleft', 'circleopen', 'slideleft', 'fade', 'smoothright']
+              # Energetic, varied set — quick wipes + punches over smooth fades.
+              transitions = [
+                  'fade', 'wipeleft', 'circleopen', 'pixelize',
+                  'radial', 'fadeblack', 'distance', 'smoothup',
+              ]
               inputs_flat = []
               for s in segments:
                   inputs_flat += ['-i', s]
@@ -801,17 +947,22 @@ jobs:
                   )
                   prev = out_lbl
                   cum += durations[idx] - XFADE
+              # Final filmic polish — subtle grain + slight saturation/contrast lift
+              # so the whole video has a consistent "alive" look regardless of source mix.
+              filters.append(
+                  f"{prev}noise=alls=8:allf=t+u,eq=saturation=1.08:contrast=1.05[vfinal]"
+              )
               filter_complex = ';'.join(filters)
 
               cmd = [
                   'ffmpeg', '-y', *inputs_flat,
                   '-filter_complex', filter_complex,
-                  '-map', prev,
+                  '-map', '[vfinal]',
                   '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
                   '-pix_fmt', 'yuv420p',
                   '/tmp/render/video_stitched.mp4',
               ]
-              print(f"Stitching with xfade ({len(segments)} segments)...")
+              print(f"Stitching with xfade+grain ({len(segments)} segments)...")
               r = subprocess.run(cmd, capture_output=True, text=True)
               if r.returncode != 0:
                   print(f"⚠ xfade failed, falling back to concat: {r.stderr[-300:]}")
@@ -824,7 +975,7 @@ jobs:
                       '/tmp/render/video_stitched.mp4',
                   ], check=True)
               else:
-                  print("✅ xfade stitched")
+                  print("✅ xfade+grain stitched")
           PYEOF
         env:
           DURATIONS: ${{ inputs.scene_durations }}
